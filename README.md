@@ -1,5 +1,8 @@
 <!-- badges: start -->
 [![R CMD check](https://github.com/spang-lab/FastRet/workflows/r-cmd-check/badge.svg)](https://github.com/spang-lab/FastRet/actions)
+[![Codecov test coverage](https://codecov.io/gh/spang-lab/FastRet/branch/main/graph/badge.svg)](https://app.codecov.io/gh/spang-lab/FastRet?branch=main)
+[![CRAN Status Badge](https://www.r-pkg.org/badges/version/FastRet)](https://cran.r-project.org/package=FastRet)
+[![CRAN Downloads Badge](https://cranlogs.r-pkg.org/badges/grand-total/FastRet)](https://cranlogs.r-pkg.org/badges/grand-total/FastRet)
 <!-- badges: end -->
 
 # FastRet
@@ -12,12 +15,15 @@ FastRet is an R package for predicting retention times in liquid chromatography.
 
 ## Installation
 
-You can install the development version of FastRet from [GitHub](https://github.com/) with:
+You can install the development version of FastRet from [GitHub](https://github.com/) by entering the following commands in an R session:
 
 ```R
-install.packages("devtools")
-devtools::install_github("spang-lab/FastRet", build_vignettes = TRUE)
+if (Sys.which("java")[1] == "") stop("Please install a Java SDK first.")
+install.packages("pak")
+pak::pkg_install("spang-lab/FastRet")
 ```
+
+For further details see [Installation](https://spang-lab.github.io/FastRet/articles/Installation.html).
 
 ## Usage
 
