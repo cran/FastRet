@@ -1,19 +1,38 @@
 # Main (Public) #####
 
-#' @title Server function for the FastRet GUI
-#' @description This function initializes the server-side of the FastRet GUI. It sets up reactive values, initializes handlers for various events and tasks, and sets up observers and outputs.
-#' @param input List of input values from the Shiny application.
-#' @param output List of output values to be sent to the Shiny application.
-#' @param session The session object passed to function given to shinyServer.
-#' @param nsw The number of subprocesses each worker is allowed to start. The higher this number, the faster individual tasks like model fitting can be processed. Providing a value of 1 will disable parallel processing.
-#' @return No return value. The function is used for its side effect of setting up the server-side of the Shiny application.
-#'@keywords internal
 #' @noRd
+#' @keywords internal
+#'
+#' @title Server function for the FastRet GUI
+#'
+#' @description
+#' This function initializes the server-side of the FastRet GUI. It sets up
+#' shiny::reactive values, initializes handlers for various events and tasks,
+#' and sets up observers and outputs.
+#'
+#' @param input
+#' List of input values from the Shiny application.
+#'
+#' @param output
+#' List of output values to be sent to the Shiny application.
+#'
+#' @param session
+#' The session object passed to function given to shinyServer.
+#'
+#' @param nsw
+#' The number of subprocesses each worker is allowed to start. The higher this
+#' number, the faster individual tasks like model fitting can be processed.
+#' Providing a value of 1 will disable parallel processing.
+#'
+#' @return
+#' No return value. The function is used for its side effect of setting up the
+#' server-side of the Shiny application.
+#'
 fastret_server <- function(input, output, session, nsw = 1) {
     catf("Start: fastret_server (session$token == %s)", session$token)
     if (!is.numeric(nsw) || nsw < 1) stop("nsw must be a positive integer")
     SE <- environment()
-    SE$RV <- reactiveValues()
+    SE$RV <- shiny::reactiveValues()
     init_log_dir(SE)
     init_extended_tasks(SE)
     init_extended_task_handlers(SE)
@@ -27,7 +46,6 @@ fastret_server <- function(input, output, session, nsw = 1) {
     init_table_output_handler(SE)
     init_plot_output_handler(SE)
     init_outputs(SE)
-    init_mocks(SE)
     init_download_handlers(SE)
     catf("Exit: fastret_server")
 }
@@ -58,7 +76,7 @@ init_extended_task_handlers <- function(SE) {
             NAME <- frm$df$NAME
             SMILES <- frm$df$SMILES
             RT_PREDICTED <- round(predict(frm), 2)
-            RT_PREDICTED_CV <- round(frm$cv$preds, 2)
+            RT_PREDICTED_CV <- if (!is.null(frm$cv)) round(frm$cv$preds, 2) else rep(NA, nrow(frm$df))
             SE$RV$trainedFRM <- frm
             SE$RV$tblTrainResults <- cbind(RT, RT_PREDICTED, RT_PREDICTED_CV, NAME, SMILES, cds)
             catf("Showing buttons: dbSaveModel, dbSavePredictorSet")
@@ -115,9 +133,9 @@ init_extended_task_handlers <- function(SE) {
 
 init_reactives <- function(SE) {
     SE$R <- list()
-    SE$R$predDfCombined <- reactive({
-        smiles <- SE$RV$predSmiles
-        df <- SE$RV$predDf
+    SE$R$predDfCombined <- shiny::reactive({
+        smiles <- SE$RV$predSmiles # data.frame(NAME = "Input SMILES", SMILES = smiles)
+        df <- SE$RV$predDf # data.frame(NAME = names, SMILES = smiles)
         if (is.null(smiles) && is.null(df)) return(NULL)
         if (is.null(smiles)) return(df)
         if (is.null(df)) return(smiles)
@@ -142,11 +160,13 @@ init_action_button_handlers <- function(SE) {
     }
     SE$ABH$btnPred <- function(SE) {
         frm <- SE$RV$inpFRM
-        df <- SE$R$predDfCombined()
+        df <- SE$R$predDfCombined() # data.frame(NAME, SMILES)
         if (is.null(frm) || is.null(frm$model)) stop("Please upload a valid model first")
         if (is.null(df) || nrow(df) == 0) stop("Please enter a valid SMILES string first or upload a list of SMILES as xlsx")
         SE$ET$btnPred$invoke( # takes same argument as [predict()]
-            object = frm, df = df, verbose = 1,
+            object = frm,
+            df = df,
+            verbose = 1,
             adjust = NULL # i.e. adjust predictions if `object$adj` is not NULL
         )
     }
@@ -182,11 +202,16 @@ init_input_handlers <- function(SE) {
                 SE$output$toPredSmilesError <- NULL
             } else {
                 catf("Validating SMILES string")
-                tmp <- try(suppressWarnings(getCDsFor1Molecule(smiles, verbose = 0)), silent = TRUE)
+                # Validate SMILES by trying to parse it with rCDK
+                tmp <- try(silent = TRUE, {
+                    obj <- rcdk::parse.smiles(smiles)[[1]]
+                    rcdk::convert.implicit.to.explicit(obj)
+                    TRUE
+                })
                 if (inherits(tmp, "try-error")) {
                     catf("Validation failed. Displaying 'Error: SMILES string is invalid'")
                     SE$RV$predSmiles <- NULL
-                    SE$output$toPredSmilesError <- renderText("Error: SMILES string is invalid")
+                    SE$output$toPredSmilesError <- shiny::renderText("Error: SMILES string is invalid")
                 } else {
                     catf("Validation successful. Updating SE$RV$predSmiles")
                     SE$RV$predSmiles <- data.frame(NAME = "Input SMILES", SMILES = smiles)
@@ -197,7 +222,7 @@ init_input_handlers <- function(SE) {
         error = function(e) {
             catf("Validation failed. Displaying error message")
             SE$RV$predSmiles <- NULL
-            SE$output$toPredXlsxError <- renderText(sprintf("Error: %s\n", e$message))
+            SE$output$toPredXlsxError <- shiny::renderText(sprintf("Error: %s\n", e$message))
         })
     }
     # catf("Exit: init_input_handlers")
@@ -206,16 +231,16 @@ init_input_handlers <- function(SE) {
 init_download_handlers <- function(SE) {
     catf("Start: init_download_handlers")
     SE$DLH <- list()
-    SE$DLH$dbSavePredictorSet <- downloadHandler(
+    SE$DLH$dbSavePredictorSet <- shiny::downloadHandler(
         filename = function() {
             paste("predictor_set_", Sys.Date(), ".xlsx", sep = "")
         },
         content = function(file) {
             frm <- SE$RV$trainedFRM
-            xlsx::write.xlsx(frm$df, file, row.names = FALSE)
+            openxlsx::write.xlsx(frm$df, file, rowNames = FALSE)
         }
     )
-    SE$DLH$dbSaveModel <- downloadHandler(
+    SE$DLH$dbSaveModel <- shiny::downloadHandler(
         filename = function() {
             frm <- SE$RV$trainedFRM
             mtype <- if (inherits(frm$model, "xgb.Booster")) "xgboost" else "lasso"
@@ -225,23 +250,23 @@ init_download_handlers <- function(SE) {
             saveRDS(SE$RV$trainedFRM, file)
         }
     )
-    SE$DLH$dbSaveCluster <- downloadHandler(
+    SE$DLH$dbSaveCluster <- shiny::downloadHandler(
         filename = function() {
             sprintf("fastret-k-%s-clustering.xlsx", SE$input$niK)
         },
         content = function(file) {
-            xlsx::write.xlsx(SE$RV$cluster_calc$clustering, file, row.names = FALSE)
+            openxlsx::write.xlsx(SE$RV$cluster_calc$clustering, file, rowNames = FALSE)
         }
     )
-    SE$DLH$dbSavePred <- downloadHandler(
+    SE$DLH$dbSavePred <- shiny::downloadHandler(
         filename = function() {
             "predictions.xlsx"
         },
         content = function(file) {
-            xlsx::write.xlsx(SE$RV$tblPredResults, file, row.names = FALSE)
+            openxlsx::write.xlsx(SE$RV$tblPredResults, file, rowNames = FALSE)
         }
     )
-    SE$DLH$dbSaveAdjModel <- downloadHandler(
+    SE$DLH$dbSaveAdjModel <- shiny::downloadHandler(
         filename = function() {
             frm <- SE$ET$btnAdj$result()
             mtype <- if (inherits(frm$model, "xgb.Booster")) "xgboost" else "lasso"
@@ -265,36 +290,36 @@ init_upload_handlers <- function(SE) {
             ubInpFRM <- validate_inputmodel(ubInpFRM)
             catf("Validation successful. Updating: SE$RV$inpFRM and SE$output$toInpFRMError.")
             SE$RV$inpFRM <- ubInpFRM
-            SE$output$toInpFRMError <- renderText("")
+            SE$output$toInpFRMError <- shiny::renderText("")
         },
         error = function(e) {
             catf("Validation failed. Updating: SE$output$toInpFRMError and SE$RV$inpFRM.")
             SE$RV$inpFRM <- NULL
-            SE$output$toInpFRMError <- renderText(paste("Error:", e$message))
+            SE$output$toInpFRMError <- shiny::renderText(paste("Error:", e$message))
         })
     }
     SE$ULH$ubInpXlsx <- function(SE) {
         tryCatch({
             xlsx <- SE$input$ubInpXlsx$datapath
             catf("Reading and validating %s", xlsx)
-            inpDf <- readxl::read_excel(xlsx, sheet = 1)
-            inpDf <- validate_inputdata(inpDf, min_cds = 0)
+            inpDf <- openxlsx::read.xlsx(xlsx, sheet = 1)
+            inpDf <- validate_inputdata(inpDf, min_cds = 0, stop_on_unknown = FALSE)
             catf("Validation successful. Updating: SE$RV$inpDf and SE$output$toInpXlsxError.")
             SE$RV$inpDf <- inpDf
-            SE$output$toInpXlsxError <- renderText("")
+            SE$output$toInpXlsxError <- shiny::renderText("")
         },
         error = function(e) {
             catf("Validation failed. Updating: SE$output$toInpXlsxError and SE$RV$inpDf.")
             SE$RV$inpDf <- NULL
-            SE$output$toInpXlsxError <- renderText(paste("Error:", e$message))
+            SE$output$toInpXlsxError <- shiny::renderText(paste("Error:", e$message))
         })
     }
     SE$ULH$ubPredXlsx <- function(SE) {
         tryCatch({
             xlsx <- SE$input$ubPredXlsx$datapath
             catf("Reading and validating %s", xlsx)
-            pred_df <- as.data.frame(readxl::read_excel(xlsx, sheet = 1))
-            pred_df <- validate_inputdata(pred_df, require = c("NAME", "SMILES"), min_cds = 0)
+            pred_df <- openxlsx::read.xlsx(xlsx, sheet = 1)
+            pred_df <- validate_inputdata(pred_df, require = c("NAME", "SMILES"), min_cds = 0, stop_on_unknown = FALSE)
             catf("Validation successful. Updating: SE$RV$predDf and SE$output$toPredXlsxError.")
             SE$RV$predDf <- pred_df
             SE$output$toPredXlsxError <- NULL
@@ -302,23 +327,23 @@ init_upload_handlers <- function(SE) {
         error = function(e) {
             catf("Validation failed. Updating: SE$output$toPredXlsxError and SE$RV$pred_df.")
             SE$RV$predDf <- NULL
-            SE$output$toPredXlsxError <- renderText(sprintf("Error: %s\n", e$message))
+            SE$output$toPredXlsxError <- shiny::renderText(sprintf("Error: %s\n", e$message))
         })
     }
     SE$ULH$ubAdjXlsx <- function(SE) {
         tryCatch({
             xlsx <- SE$input$ubAdjXlsx$datapath
             catf("Reading and validating %s", xlsx)
-            adjDf <- readxl::read_excel(xlsx, sheet = 1)
-            adjDf <- validate_inputdata(adjDf, min_cds = 0)
+            adjDf <- openxlsx::read.xlsx(xlsx, sheet = 1)
+            adjDf <- validate_inputdata(adjDf, min_cds = 0, stop_on_unknown = FALSE)
             catf("Validation successful. Updating: SE$RV$adjDf and SE$output$toAdjXlsxError.")
             SE$RV$adjDf <- adjDf
-            SE$output$toAdjXlsxError <- renderText("")
+            SE$output$toAdjXlsxError <- shiny::renderText("")
         },
         error = function(e) {
             catf("Validation failed. Updating: SE$output$toAdjXlsxError and SE$RV$adjDf.")
             SE$RV$adjDf <- NULL
-            SE$output$toAdjXlsxError <- renderText(paste("Error:", e$message))
+            SE$output$toAdjXlsxError <- shiny::renderText(paste("Error:", e$message))
         })
     }
     # catf("Exit: init_upload_handlers")
@@ -338,11 +363,11 @@ init_observers <- function(SE) {
 
     # Special Events
     shinyhelper::observe_helpers()
-    onSessionEnded(function() SE$SEH$SessionEnded(SE))
+    shiny::onSessionEnded(function() SE$SEH$SessionEnded(SE))
 
     # Upload Button Handler
     lapply(names(SE$ULH), function(x) {
-        observeEvent(SE$input[[x]], {
+        shiny::observeEvent(SE$input[[x]], {
             catf("Start: SE$ULH$%s", x)
             SE$ULH[[x]](SE)
             catf("Exit: SE$ULH$%s", x)
@@ -351,7 +376,7 @@ init_observers <- function(SE) {
 
     # Action Button Handler
     lapply(names(SE$ABH), function(x) {
-        observeEvent(SE$input[[x]], {
+        shiny::observeEvent(SE$input[[x]], {
             catf("Start: SE$ABH$%s", x)
             withShowError(SE$ABH[[x]](SE))
             catf("Exit: SE$ABH$%s", x)
@@ -360,7 +385,7 @@ init_observers <- function(SE) {
 
     # Input Widget Handler
     lapply(names(SE$IPH), function(x) {
-        observeEvent(SE$input[[x]], {
+        shiny::observeEvent(SE$input[[x]], {
             catf("Start: SE$IPH$%s", x)
             SE$IPH[[x]](SE)
             catf("Exit: SE$IPH$%s", x)
@@ -369,7 +394,7 @@ init_observers <- function(SE) {
 
     # Extended Task Handler
     lapply(names(SE$ETH), function(x) {
-        observeEvent(
+        shiny::observeEvent(
             eventExpr = SE$ET[[x]]$status(),
             handlerExpr = {
                 catf("Start: SE$ETH$%s", x)
@@ -378,15 +403,16 @@ init_observers <- function(SE) {
             },
             ignoreInit = TRUE
         )
-        bslib::bind_task_button(SE$ET[[x]], x) # 1)
-        # 1) Binds the given extended task to the input_task_button with ID `x`,
-        #    i.e. it gets disabled while the extended task is running. Note: for
-        #    the above to work, the extended task, the extended task handler and
-        #    the corresponding input_task_button must use the same ID.
+        bslib::bind_task_button(SE$ET[[x]], x) # (1)
+        # (1) Binds the given extended task to the input_task_button with ID
+        # `x`, i.e. it gets disabled while the extended task is running. Note:
+        # for the above to work, the extended task, the extended task handler
+        # and the corresponding input_task_button must use the same ID.
     })
 
     # Download Buttons Handler
-    # (must be stored inside `output` because that's where `shiny::downloadButton` looks for them)
+    # (must be stored inside `output` because that's where
+    # `shiny::downloadButton` looks for them)
     lapply(names(SE$DLH), function(x) {
         SE$output[[x]] <- SE$DLH[[x]]
     })
@@ -490,28 +516,28 @@ init_table_output_handler <- function(SE) {
 init_outputs <- function(SE) {
     catf("Start: init_outputs")
     # UI outputs
-    SE$output$ui_train_results   <- renderUI(ui_train_results(SE))
-    SE$output$ui_sm_results      <- renderUI(ui_sm_results(SE))
-    SE$output$ui_predict_results <- renderUI(ui_predict_results(SE))
-    SE$output$ui_adjust_results  <- renderUI(ui_adjust_results(SE))
+    SE$output$ui_train_results   <- shiny::renderUI(ui_train_results(SE))
+    SE$output$ui_sm_results      <- shiny::renderUI(ui_sm_results(SE))
+    SE$output$ui_predict_results <- shiny::renderUI(ui_predict_results(SE))
+    SE$output$ui_adjust_results  <- shiny::renderUI(ui_adjust_results(SE))
     # Plot Outputs
-    SE$output$poTrainPerfCV <- renderPlot(SE$POH$poTrainPerfCV(SE), execOnResize = TRUE)
-    SE$output$poTrainPerf   <- renderPlot(SE$POH$poTrainPerf(SE), execOnResize = TRUE)
-    SE$output$poAdjPerfCV   <- renderPlot(SE$POH$poAdjPerfCV(SE), execOnResize = TRUE)
-    SE$output$poAdjPerf     <- renderPlot(SE$POH$poAdjPerf(SE), execOnResize = TRUE)
+    SE$output$poTrainPerfCV <- shiny::renderPlot(SE$POH$poTrainPerfCV(SE), execOnResize = TRUE)
+    SE$output$poTrainPerf   <- shiny::renderPlot(SE$POH$poTrainPerf(SE), execOnResize = TRUE)
+    SE$output$poAdjPerfCV   <- shiny::renderPlot(SE$POH$poAdjPerfCV(SE), execOnResize = TRUE)
+    SE$output$poAdjPerf     <- shiny::renderPlot(SE$POH$poAdjPerf(SE), execOnResize = TRUE)
     # Table Outputs
-    observe(SE$TBH$tblPredResults(SE))
-    observe(SE$TBH$tblTrainResults(SE))
-    observe(SE$TBH$tblMedoids(SE))
-    observe(SE$TBH$tblClustering(SE))
+    shiny::observe(SE$TBH$tblPredResults(SE))
+    shiny::observe(SE$TBH$tblTrainResults(SE))
+    shiny::observe(SE$TBH$tblMedoids(SE))
+    shiny::observe(SE$TBH$tblClustering(SE))
     # Text Outputs
     btnIDs <- c("btnTrain", "btnSM", "btnPred", "btnAdj")
     vtoIDs <- c("vtoTrainLogs", "vtoSMLogs", "vtoPredLogs", "vtoAdjLogs")
     lapply(seq_along(btnIDs), function(i) {
         btn <- btnIDs[i]
         vto <- vtoIDs[i]
-        SE$output[[vto]] <- renderText({
-            invalidateLater(1000)
+        SE$output[[vto]] <- shiny::renderText({
+            shiny::invalidateLater(1000)
             logfile <- file.path(SE$logdir, paste0(btn, ".log"))
             if (file.exists(logfile)) {
                 paste(readLines(logfile), collapse = "\n")
@@ -523,49 +549,35 @@ init_outputs <- function(SE) {
     # catf("Exit: init_outputs")
 }
 
-init_mocks <- function(SE) {
-    catf("Start: init_mocks")
-    mocks <- getOption("FastRet.mocks", c())
-    if (length(mocks) > 0) catf("Mocks enabled for: %s", paste(mocks, collapse = ", "))
-    if ("inpDf" %in% mocks) SE$RV$inpDf <- read_rp_xlsx()
-    if ("adjDf" %in% mocks) SE$RV$adjDf <- read_rpadj_xlsx()
-    if ("btnTrain" %in% mocks) shinyjs::click("btnTrain")
-    if ("inpFRM" %in% mocks) SE$RV$inpFRM <- readRDS(pkg_file("mockdata/lasso_model.rds"))
-    if ("cluster_calc" %in% mocks) {
-        smobj <- readRDS(pkg_file("mockdata/clustering.rds"))
-        mtbl <- smobj$clustering[smobj$clustering$IS_MEDOID, c("RT", "NAME", "CLUSTER", "SMILES")]
-        mtbl <- mtbl[order(mtbl$CLUSTER), ]
-        mtbl <- `colnames<-`(mtbl, c("RT", "NAME", "MEDOID", "SMILES"))
-        ctbl <- smobj$clustering[, c("RT", "NAME", "CLUSTER", "IS_MEDOID", "SMILES")]
-        SE$RV$cluster_calc <- smobj
-        SE$RV$tblMedoids <- mtbl
-        SE$RV$tblClustering <- ctbl
-        shinyjs::show("dbSaveCluster")
-    }
-    # catf("Exit: init_mocks")
-}
+# Inits (Private) #####
 
 
 # Helpers (Public) #####
 
 #' @export
-#' @title Execute an expression with a timeout
-#' @param expr The expression to execute
-#' @param timeout The timeout in seconds. Default is 2.
-#' @return The result of the expression
 #' @keywords internal
+#'
+#' @title Execute an expression with a timeout
+#'
+#' @param expr
+#' The expression to execute
+#'
+#' @param timeout
+#' The timeout in seconds. Default is 2.
+#'
+#' @return
+#' The result of the expression
+#'
 #' @examples
 #' withTimeout(
 #'      cat("This works\n"),
 #'      timeout = 0.2
 #' )
-#' try(
-#'      withTimeout(
-#'          expr = {Sys.sleep(0.2); cat("This fails\n")},
-#'          timeout = 0.1
-#'      ),
-#'      silent = TRUE
-#' )
+#' try(silent = TRUE, withTimeout(
+#'     expr = {Sys.sleep(0.2); cat("This fails\n")},
+#'     timeout = 0.1
+#' ))
+#'
 withTimeout <- function(expr, timeout = 2) {
     setTimeLimit(cpu = timeout, elapsed = timeout, transient = TRUE)
     on.exit(setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE), add = TRUE, after = FALSE)
@@ -573,11 +585,18 @@ withTimeout <- function(expr, timeout = 2) {
 }
 
 #' @export
-#' @title Execute an expression while redirecting output to a file
-#' @param expr The expression to execute
-#' @param logfile The file to redirect output to. Default is "tmp.txt".
-#' @return The result of the expression
 #' @keywords internal
+#'
+#' @title Execute an expression while redirecting output to a file
+#'
+#' @param expr
+#' The expression to execute
+#'
+#' @param logfile
+#' The file to redirect output to. Default is "tmp.txt".
+#'
+#' @return The result of the expression
+#'
 #' @examples
 #' logfile <- tempfile(fileext = ".txt")
 #' withSink(logfile = logfile, expr = {
@@ -585,6 +604,7 @@ withTimeout <- function(expr, timeout = 2) {
 #'   message("Goodbye")
 #' })
 #' readLines(logfile) == c("Helloworld", "Goodbye")
+#'
 withSink <- function(expr, logfile = tempfile(fileext = ".txt")) {
     zz <- file(logfile, open = "wt")
     on.exit(close(zz), add = TRUE, after = FALSE)
@@ -596,11 +616,19 @@ withSink <- function(expr, logfile = tempfile(fileext = ".txt")) {
 }
 
 #' @export
-#' @title Try expression with predefined error message
-#' @description Executes an expression and prints an error message if it fails
-#' @param expr The expression to execute
-#' @return The result of the expression
 #' @keywords internal
+#'
+#' @title Try expression with predefined error message
+#'
+#' @description
+#' Executes an expression and prints an error message if it fails
+#'
+#' @param expr
+#' The expression to execute
+#'
+#' @return
+#' The result of the expression
+#'
 #' @examples
 #' f <- function(expr) {
 #'   val <- try(expr, silent = TRUE)
@@ -610,6 +638,7 @@ withSink <- function(expr, logfile = tempfile(fileext = ".txt")) {
 #' }
 #' ret <- f(log("a")) # this error will not show up in the console
 #' ret <- f(withStopMessage(log("a"))) # this error will show up in the console
+#'
 withStopMessage <- function(expr) {
     tryCatch(expr, error = function(e) {
         message("Error in ", deparse(e$call), " : ", e$message)
@@ -618,15 +647,25 @@ withStopMessage <- function(expr) {
 }
 
 #' @export
-#' @title Initialize log directory
-#' @description Initializes the log directory for the session. It creates a new directory if it does not exist.
-#' @param SE A list containing session information.
-#' @return Updates the logdir element in the SE list with the path to the log directory.
 #' @keywords internal
+#'
+#' @title Initialize log directory
+#'
+#' @description
+#' Initializes the log directory for the session. It creates a new directory if
+#' it does not exist.
+#'
+#' @param SE
+#' A list containing session information.
+#'
+#' @return
+#' Updates the logdir element in the SE list with the path to the log directory.
+#'
 #' @examples
 #' SE <- as.environment(list(session = list(token = "asdf")))
 #' init_log_dir(SE)
 #' dir.exists(SE$logdir)
+#'
 init_log_dir <- function(SE) {
     catf("Start: init_log_dir")
     token <- SE$session$token
@@ -637,13 +676,22 @@ init_log_dir <- function(SE) {
 }
 
 #' @export
-#' @title Add line end
-#' @description Checks if a string ends with a newline character. If not, a newline character is appended.
-#' @param x A string.
-#' @return The input string with a newline character at the end if it was not already present.
 #' @keywords internal
+#'
+#' @title Add line end
+#'
+#' @description
+#' Checks if a string ends with a newline character. If not, a newline character is appended.
+#'
+#' @param x
+#' A string.
+#'
+#' @return
+#' The input string with a newline character at the end if it was not already present.
+#'
 #' @examples
 #' cat(withLineEnd("Hello"))
+#'
 withLineEnd <- function(x) {
     if (!grepl("\n$", x)) paste0(x, "\n") else x
 }
@@ -662,21 +710,33 @@ showError <- function(msg = NULL, expr = NULL, duration = 10) {
         msg <- tryCatch(expr, error = function(e) e$message)
     }
     catf("Displaying error message: %s", msg)
-    showNotification(msg, type = "error", duration = duration)
+    shiny::showNotification(msg, type = "error", duration = duration)
 }
 
 #' @noRd
-#' @title Create an ExtendedTask Object
-#' @description This function wraps a given function in a [promises::future_promise()] and the result into a [shiny::ExtendedTask()] object.
-#' When the ExtendedTask Object is invoked, the function is executed asynchronously in a seperate process (assuming [future::plan()] has been called with strategy unequal "sequential").
-#' Normal output, messages, warnings and errors from that process get redirected to `logfile`.
-#' The status of the task can be checked via the `status()` method.
-#' As soon as `status()` returns `"success"`, the result can be retrieved via the `result()` method.
-#' If an error has occured, `status()` will return `"error"`.
-#' In this case, calling `result()` will reraise the error that occured while executing the task.
-#' Querying the status or value of the task requires a reactive context, e.g. via [shiny::reactive()], [shiny::observe()] or [shiny::reactiveConsole].
-#' @param func A function that accepts any number of arguments and returns a value.
-#' @return An ExtendedTask object that wraps the provided function. For further details see: [shiny::ExtendedTask()].
+#' @title Create an shiny::ExtendedTask Object
+#'
+#' @description
+#' This function wraps a given function in a [promises::future_promise()] and
+#' the result into a [shiny::ExtendedTask()] object. When the
+#' shiny::ExtendedTask Object is invoked, the function is executed
+#' asynchronously in a seperate process (assuming [future::plan()] has been
+#' called with strategy unequal "sequential"). Normal output, messages, warnings
+#' and errors from that process get redirected to `logfile`. The status of the
+#' task can be checked via the `status()` method. As soon as `status()` returns
+#' `"success"`, the result can be retrieved via the `result()` method. If an
+#' error has occured, `status()` will return `"error"`. In this case, calling
+#' `result()` will reraise the error that occured while executing the task.
+#' Querying the status or value of the task requires a shiny::reactive context,
+#' e.g. via [shiny::reactive()], [shiny::observe()] or [shiny::reactiveConsole].
+#'
+#' @param func
+#' A function that accepts any number of arguments and returns a value.
+#'
+#' @return
+#' An shiny::ExtendedTask object that wraps the provided function. For further
+#' details see: [shiny::ExtendedTask()].
+#'
 #' @examples
 #' shiny::reactiveConsole(enabled = TRUE)
 #' on.exit(shiny::reactiveConsole(enabled = FALSE), add = TRUE)
@@ -710,7 +770,7 @@ extendedTask <- function(func, logfile = tempfile(fileext = ".log"), timeout = 3
     logfile <- logfile
     func <- as.symbol(func)
     langobj <- substitute(
-        ExtendedTask$new(function(...) {
+        shiny::ExtendedTask$new(function(...) {
             promises::future_promise(
                 seed = TRUE,
                 conditions = NULL,
@@ -743,21 +803,48 @@ extendedTask <- function(func, logfile = tempfile(fileext = ".log"), timeout = 3
 }
 
 #' @noRd
-#' @title Create an ExtendedTask Handler
-#' @description This function creates a handler for an ExtendedTask object. The handler checks the status of the task and executes the appropriate function based on the status. The status can be "error", "running", "success", or "initial".
-#' @param id The ID of the ExtendedTask object. This ID must be unique and must match the ID of an ExtendedTask object created via `init_extended_tasks()`.
-#' @param onSuccess A function that is executed when the task completes successfully. This function accepts a single argument `SE`, which must point to the environment of the corresponding shiny server function. I.e. inside `server` you should call `SE <- environment()` and pass `SE` to this function.
-#' @param onRunning A function that is executed when the task is still running. This function also accepts the session environment `SE` as an argument.
-#' @param onError A function that is executed when the task encounters an error. This function also accepts the session environment `SE` as an argument.
-#' @param displayError A boolean value that determines whether to display an error message to the user when the task encounters an error. The default value is TRUE.
-#' @return A function that checks the status of the ExtendedTask object and executes the appropriate function based on the status.
+#' @title Create an shiny::ExtendedTask Handler
+#'
+#' @description
+#' This function creates a handler for an shiny::ExtendedTask object. The
+#' handler checks the status of the task and executes the appropriate function
+#' based on the status. The status can be "error", "running", "success", or
+#' "initial".
+#'
+#' @param id
+#' The ID of the shiny::ExtendedTask object. This ID must be unique and must
+#' match the ID of an shiny::ExtendedTask object created via
+#' `init_extended_tasks()`.
+#'
+#' @param onSuccess
+#' A function that is executed when the task completes successfully. This
+#' function accepts a single argument `SE`, which must point to the environment
+#' of the corresponding shiny server function. I.e. inside `server` you should
+#' call `SE <- environment()` and pass `SE` to this function.
+#'
+#' @param onRunning
+#' A function that is executed when the task is still running. This function
+#' also accepts the session environment `SE` as an argument.
+#'
+#' @param onError
+#' A function that is executed when the task encounters an error. This function
+#' also accepts the session environment `SE` as an argument.
+#'
+#' @param displayError
+#' A boolean value that determines whether to display an error message to the
+#' user when the task encounters an error. The default value is TRUE.
+#'
+#' @return
+#' A function that checks the status of the shiny::ExtendedTask object and
+#' executes the appropriate function based on the status.
+#'
 #' @examples
 #' logfile <- tempfile(fileext = ".log")
 #' f <- function(x) log(x)
 #' SE <- list(ET = list(task1 = extendedTask(f, logfile)))
 #' f <- function(SE) print("Task completed successfully!")
-#'
 #' extendedTaskHandler(id = "task1", onSuccess = f)
+#'
 extendedTaskHandler <- function(id,
                                 onSuccess = function(SE) {},
                                 onRunning = function(SE) {},
@@ -784,7 +871,7 @@ extendedTaskHandler <- function(id,
             catf("Task has not been started yet. Doing nothing.")
             return(NULL)
         } else {
-            stop("Unknown status of ExtendedTask object")
+            stop("Unknown status of shiny::ExtendedTask object")
         }
     }
 }
@@ -798,4 +885,41 @@ renderTbl <- function(expr,
         scrollX = scrollX
     )
     DT::renderDT(expr = expr, rownames = rownames, options = opts)
+}
+
+validate_inputdata <- function(df,
+                               require = c("RT", "SMILES", "NAME"),
+                               min_cds = 1,
+                               stop_on_unknown = TRUE) {
+    missing_cols <- setdiff(require, colnames(df))
+    if (length(missing_cols) > 0) stop(sprintf("missing columns: %s", paste(missing_cols, collapse = ", ")))
+    n_cds <- sum(colnames(df) %in% CDFeatures)
+    if (n_cds < min_cds) {
+        msg <- sprintf("At least %d chemical descriptors are required, but only %d are present", min_cds, n_cds)
+        stop(msg)
+    }
+    unnown_cols <- setdiff(colnames(df), c("RT", "SMILES", "NAME", CDFeatures))
+    if (stop_on_unknown && length(unnown_cols) > 0) {
+        msg <- sprintf("Unknown columns present: %s", paste(unnown_cols, collapse = ", "))
+        stop(msg)
+    }
+    invisible(df)
+}
+
+validate_inputmodel <- function(model) {
+    model_nams <- names(model)
+    expected_names <- c("model", "df", "cv")
+    n_missing <- sum(!expected_names %in% model_nams)
+    if (n_missing > 0) {
+        if (n_missing < length(expected_names)) {
+            missing <- paste(setdiff(expected_names, model_nams), collapse = ", ")
+            errmsg1 <- sprintf("Model object is missing required elements: %s.", missing)
+        } else {
+            errmsg1 <- sprintf("Model object is invalid.")
+        }
+        errmsg2 <- sprintf("Please upload a model trained with FastRet version %s or greater.", packageVersion("FastRet"))
+        errmsg <- paste(errmsg1, errmsg2)
+        stop(errmsg)
+    }
+    invisible(model)
 }

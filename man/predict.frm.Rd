@@ -4,16 +4,31 @@
 \alias{predict.frm}
 \title{Predict retention times using a FastRet Model}
 \usage{
-\method{predict}{frm}(object = train_frm(), df = object$df, adjust = NULL, verbose = 0, ...)
+\method{predict}{frm}(
+  object = train_frm(),
+  df = object$df,
+  adjust = NULL,
+  verbose = 0,
+  clip = TRUE,
+  impute = TRUE,
+  ...
+)
 }
 \arguments{
 \item{object}{An object of class \code{frm} as returned by \code{\link[=train_frm]{train_frm()}}.}
 
 \item{df}{A data.frame with the same columns as the training data.}
 
-\item{adjust}{If \code{object} was adjusted using \code{\link[=adjust_frm]{adjust_frm()}}, it will contain a property \code{object$adj}. If \code{adjust} is TRUE, \code{object$adj} will be used to adjust predictions obtained from \code{object$model}. If FALSE \code{object$adj} will be ignored. If NULL, \code{object$model} will be used, if available.}
+\item{adjust}{If \code{object} was adjusted using \code{\link[=adjust_frm]{adjust_frm()}}, it will contain a property
+\code{object$adj}. If \code{adjust} is TRUE, \code{object$adj} will be used to adjust
+predictions obtained from \code{object$model}. If FALSE \code{object$adj} will be
+ignored. If NULL, \code{object$model} will be used, if available.}
 
 \item{verbose}{A logical value indicating whether to print progress messages.}
+
+\item{clip}{Clip predictions to be within RT range of training data?}
+
+\item{impute}{Impute missing predictor values using column means of training data?}
 
 \item{...}{Not used. Required to match the generic signature of \code{predict()}.}
 }
@@ -24,9 +39,9 @@ A numeric vector with the predicted retention times.
 Predict retention times for new data using a FastRet Model (FRM).
 }
 \examples{
-frm <- read_rp_lasso_model_rds()
-newdata <- head(RP)
-yhat <- predict(frm, newdata)
+object <- read_rp_lasso_model_rds()
+df <- head(RP)
+yhat <- predict(object, df)
 }
 \seealso{
 \code{\link[=train_frm]{train_frm()}}, \code{\link[=adjust_frm]{adjust_frm()}}
