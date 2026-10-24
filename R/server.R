@@ -70,7 +70,13 @@ init_extended_task_handlers <- function(SE) {
         onSuccess = function(SE) {
             catf("Upating: SE$RV$trainedFRM, SE$RV$tblTrainResults")
             frm <- SE$ET$btnTrain$result()
-            cds <- frm$df[!colnames(frm$df) %in% c("NAME", "RT", "SMILES")]
+            # Exclude ALL metadata columns (not just NAME/RT/SMILES) before
+            # rounding: frm$df also retains the optional character column
+            # INCHIKEY, and round()ing a data.frame with a character column
+            # errors ("non-numeric-alike variable(s)"). Because this handler runs
+            # in a status observer without a tryCatch, such an error tears down
+            # the whole Shiny session (the GUI greys out and must be restarted).
+            cds <- frm$df[colnames(frm$df) %in% CDFeatures]
             cds <- round(cds, 2)
             RT <- round(frm$df$RT, 2)
             NAME <- frm$df$NAME
@@ -139,7 +145,7 @@ init_reactives <- function(SE) {
         if (is.null(smiles) && is.null(df)) return(NULL)
         if (is.null(smiles)) return(df)
         if (is.null(df)) return(smiles)
-        row1 <- structure(rep(NA, ncol(df)), .Names = colnames(df))
+        row1 <- stats::setNames(rep(NA, ncol(df)), colnames(df))
         row1[names(smiles)] <- smiles
         dfCombined <- rbind(row1, df)
         return(dfCombined)
@@ -150,16 +156,22 @@ init_action_button_handlers <- function(SE) {
     catf("Start: init_action_button_handlers")
     SE$ABH <- list()
     SE$ABH$btnTrain <- function(SE) {
-        if (is.null(SE$RV$inpDf)) stop("Please upload a excel sheet with the required data first")
+        if (is.null(SE$RV$trainDf)) stop("Please upload a excel sheet with the required data first")
+        method <- c("lasso", "gbtree")[as.numeric(SE$input$rbMethod)]
+        # The "Tune hyperparameters" checkbox turns on a small grid search for
+        # XGBoost; it has no effect for Lasso (train_frm() ignores tune_grid there).
+        tune_grid <- if (isTRUE(SE$input$cbTuneGrid) && method == "gbtree") "small" else NULL
         SE$ET$btnTrain$invoke( # takes same argument as [train_frm()]
-            df = SE$RV$inpDf,
-            method = c("lasso", "gbtree")[as.numeric(SE$input$rbMethod)],
+            df = SE$RV$trainDf,
+            method = method,
+            tune_grid = tune_grid,
             verbose = 1,
-            nw = SE$nsw
+            nw = SE$nsw,
+            seed = SE$input$seed
         )
     }
     SE$ABH$btnPred <- function(SE) {
-        frm <- SE$RV$inpFRM
+        frm <- SE$RV$predFRM
         df <- SE$R$predDfCombined() # data.frame(NAME, SMILES)
         if (is.null(frm) || is.null(frm$model)) stop("Please upload a valid model first")
         if (is.null(df) || nrow(df) == 0) stop("Please enter a valid SMILES string first or upload a list of SMILES as xlsx")
@@ -171,20 +183,31 @@ init_action_button_handlers <- function(SE) {
         )
     }
     SE$ABH$btnSM <- function(SE) {
-        if (is.null(SE$RV$inpDf)) stop("Please upload a excel sheet with the required data first")
+        if (is.null(SE$RV$smDf)) stop("Please upload a excel sheet with the required data first")
         SE$ET$btnSM$invoke( # takes same argument as [selective_measuring()]
-            SE$RV$inpDf,
+            SE$RV$smDf,
             k_cluster = SE$input$niK,
+            rt_coef = SE$input$siSmVariant,
+            seed = SE$input$niSmSeed,
             verbose = 1
         )
     }
     SE$ABH$btnAdj <- function(SE) {
-        if (!inherits(SE$RV$inpFRM, "frm")) stop("Please upload a valid, pretrained model first")
+        if (!inherits(SE$RV$adjFRM, "frm")) stop("Please upload a valid, pretrained model first")
         if (is.null(SE$RV$adjDf)) stop("Please upload valid data for prediction adjustment first")
+        match_keys <- switch(SE$input$siAdjMatchKeys,
+            "auto"       = NULL, # let adjust_frm() choose: INCHIKEY if available, else NAME+SMILES
+            "INCHIKEY"   = "INCHIKEY",
+            "NAME"       = "NAME",
+            "NAME+SMILES" = c("NAME", "SMILES"),
+            NULL
+        )
         SE$ET$btnAdj$invoke( # takes same argument as [adjust_frm()]
-            frm = SE$RV$inpFRM,
+            frm = SE$RV$adjFRM,
             new_data = SE$RV$adjDf,
-            predictors = as.numeric(SE$input$ciPredictors)
+            adj_type = SE$input$rbAdjMethod,
+            predictors = 1, # base RT only; RT transformations are deprecated
+            match_keys = match_keys
         )
     }
     # catf("Exit: init_action_button_handlers")
@@ -282,43 +305,19 @@ init_download_handlers <- function(SE) {
 init_upload_handlers <- function(SE) {
     catf("Start: init_upload_handlers")
     SE$ULH <- list()
-    SE$ULH$ubInpFRM <- function(SE) {
-        tryCatch({
-            rds <- SE$input$ubInpFRM$datapath
-            catf("Reading and validating %s", rds)
-            ubInpFRM <- readRDS(rds)
-            ubInpFRM <- validate_inputmodel(ubInpFRM)
-            catf("Validation successful. Updating: SE$RV$inpFRM and SE$output$toInpFRMError.")
-            SE$RV$inpFRM <- ubInpFRM
-            SE$output$toInpFRMError <- shiny::renderText("")
-        },
-        error = function(e) {
-            catf("Validation failed. Updating: SE$output$toInpFRMError and SE$RV$inpFRM.")
-            SE$RV$inpFRM <- NULL
-            SE$output$toInpFRMError <- shiny::renderText(paste("Error:", e$message))
-        })
-    }
-    SE$ULH$ubInpXlsx <- function(SE) {
-        tryCatch({
-            xlsx <- SE$input$ubInpXlsx$datapath
-            catf("Reading and validating %s", xlsx)
-            inpDf <- openxlsx::read.xlsx(xlsx, sheet = 1)
-            inpDf <- validate_inputdata(inpDf, min_cds = 0, stop_on_unknown = FALSE)
-            catf("Validation successful. Updating: SE$RV$inpDf and SE$output$toInpXlsxError.")
-            SE$RV$inpDf <- inpDf
-            SE$output$toInpXlsxError <- shiny::renderText("")
-        },
-        error = function(e) {
-            catf("Validation failed. Updating: SE$output$toInpXlsxError and SE$RV$inpDf.")
-            SE$RV$inpDf <- NULL
-            SE$output$toInpXlsxError <- shiny::renderText(paste("Error:", e$message))
-        })
-    }
+    # The data-upload (Train + Select) and model-upload (Predict + Adjust)
+    # widgets exist once per tab with unique ids, so they get one handler each,
+    # built from the shared factories below.
+    SE$ULH$ubTrainXlsx <- make_xlsx_upload_handler("ubTrainXlsx", "trainDf", "toTrainXlsxError")
+    SE$ULH$ubSmXlsx    <- make_xlsx_upload_handler("ubSmXlsx", "smDf", "toSmXlsxError")
+    SE$ULH$ubPredFRM   <- make_model_upload_handler("ubPredFRM", "predFRM", "toPredFRMError")
+    SE$ULH$ubAdjFRM    <- make_model_upload_handler("ubAdjFRM", "adjFRM", "toAdjFRMError")
     SE$ULH$ubPredXlsx <- function(SE) {
         tryCatch({
             xlsx <- SE$input$ubPredXlsx$datapath
             catf("Reading and validating %s", xlsx)
-            pred_df <- openxlsx::read.xlsx(xlsx, sheet = 1)
+            pred_df <- read_input_xlsx(xlsx, require = c("NAME", "SMILES"))
+            notify_dropped_columns(pred_df)
             pred_df <- validate_inputdata(pred_df, require = c("NAME", "SMILES"), min_cds = 0, stop_on_unknown = FALSE)
             catf("Validation successful. Updating: SE$RV$predDf and SE$output$toPredXlsxError.")
             SE$RV$predDf <- pred_df
@@ -334,7 +333,8 @@ init_upload_handlers <- function(SE) {
         tryCatch({
             xlsx <- SE$input$ubAdjXlsx$datapath
             catf("Reading and validating %s", xlsx)
-            adjDf <- openxlsx::read.xlsx(xlsx, sheet = 1)
+            adjDf <- read_input_xlsx(xlsx, require = c("RT", "SMILES", "NAME"))
+            notify_dropped_columns(adjDf)
             adjDf <- validate_inputdata(adjDf, min_cds = 0, stop_on_unknown = FALSE)
             catf("Validation successful. Updating: SE$RV$adjDf and SE$output$toAdjXlsxError.")
             SE$RV$adjDf <- adjDf
@@ -398,7 +398,9 @@ init_observers <- function(SE) {
             eventExpr = SE$ET[[x]]$status(),
             handlerExpr = {
                 catf("Start: SE$ETH$%s", x)
-                SE$ETH[[x]](SE)
+                # Guard the result handler: an uncaught error here (it runs in a
+                # reactive observer) would otherwise tear down the whole session.
+                withShowError(SE$ETH[[x]](SE))
                 catf("Exit: SE$ETH$%s", x)
             },
             ignoreInit = TRUE
@@ -698,6 +700,50 @@ withLineEnd <- function(x) {
 
 # Helpers (Private) #####
 
+# Build an upload handler that reads + validates an xlsx of training/SM data and
+# stores the result in `SE$RV[[rvName]]` (or NULL on error), reporting errors via
+# the `errorId` text output.
+make_xlsx_upload_handler <- function(inputId, rvName, errorId) {
+    function(SE) {
+        tryCatch({
+            xlsx <- SE$input[[inputId]]$datapath
+            catf("Reading and validating %s", xlsx)
+            df <- read_input_xlsx(xlsx, require = c("RT", "SMILES", "NAME"))
+            notify_dropped_columns(df)
+            df <- validate_inputdata(df, min_cds = 0, stop_on_unknown = FALSE)
+            catf("Validation successful. Updating: SE$RV$%s and SE$output$%s.", rvName, errorId)
+            SE$RV[[rvName]] <- df
+            SE$output[[errorId]] <- shiny::renderText("")
+        },
+        error = function(e) {
+            catf("Validation failed. Updating: SE$output$%s and SE$RV$%s.", errorId, rvName)
+            SE$RV[[rvName]] <- NULL
+            SE$output[[errorId]] <- shiny::renderText(paste("Error:", e$message))
+        })
+    }
+}
+
+# Build an upload handler that reads + validates a pretrained frm (.rds) and
+# stores it in `SE$RV[[rvName]]` (or NULL on error).
+make_model_upload_handler <- function(inputId, rvName, errorId) {
+    function(SE) {
+        tryCatch({
+            rds <- SE$input[[inputId]]$datapath
+            catf("Reading and validating %s", rds)
+            model <- readRDS(rds)
+            model <- validate_inputmodel(model)
+            catf("Validation successful. Updating: SE$RV$%s and SE$output$%s.", rvName, errorId)
+            SE$RV[[rvName]] <- model
+            SE$output[[errorId]] <- shiny::renderText("")
+        },
+        error = function(e) {
+            catf("Validation failed. Updating: SE$output$%s and SE$RV$%s.", errorId, rvName)
+            SE$RV[[rvName]] <- NULL
+            SE$output[[errorId]] <- shiny::renderText(paste("Error:", e$message))
+        })
+    }
+}
+
 withShowError <- function(expr, error = NULL) {
     tryCatch(
         expr,
@@ -885,6 +931,57 @@ renderTbl <- function(expr,
         scrollX = scrollX
     )
     DT::renderDT(expr = expr, rownames = rownames, options = opts)
+}
+
+# Read an uploaded xlsx workbook robustly. Searches every worksheet for the
+# first one that contains all `require`d columns (so the relevant data may live
+# on any sheet, not just the first) and drops every column FastRet does not
+# understand (so arbitrary annotation columns in the user's file are ignored
+# instead of being carried into - and potentially breaking - model training).
+# Errors with an informative message if no worksheet provides the required
+# columns.
+read_input_xlsx <- function(path, require = c("RT", "SMILES", "NAME")) {
+    sheets <- openxlsx::getSheetNames(path)
+    if (length(sheets) == 0) stop("The uploaded file contains no worksheets.")
+    for (s in sheets) {
+        df <- tryCatch(openxlsx::read.xlsx(path, sheet = s), error = function(e) NULL)
+        if (is.data.frame(df) && nrow(df) > 0 && all(require %in% colnames(df))) {
+            return(drop_unsupported_columns(df))
+        }
+    }
+    stop(sprintf(
+        "No worksheet with the required columns (%s) found. Searched %d worksheet(s): %s.",
+        paste(require, collapse = ", "), length(sheets), paste(sheets, collapse = ", ")
+    ))
+}
+
+# Keep only the columns FastRet understands (mandatory metadata, optional
+# metadata and chemical descriptors), discarding any extra columns present in a
+# user-uploaded workbook. The names of the discarded columns are attached as the
+# "dropped_columns" attribute so the GUI can tell the user which were ignored
+# (see notify_dropped_columns()).
+drop_unsupported_columns <- function(df) {
+    supported <- c("NAME", "RT", "SMILES", "INCHIKEY", "RT_ADJ", CDFeatures)
+    keep <- colnames(df) %in% supported
+    out <- df[, keep, drop = FALSE]
+    attr(out, "dropped_columns") <- colnames(df)[!keep]
+    out
+}
+
+# Show a GUI notification listing any columns that drop_unsupported_columns()
+# discarded from an uploaded workbook, so the loss is never silent. No-op when
+# nothing was dropped or when not running inside a Shiny session.
+notify_dropped_columns <- function(df) {
+    dropped <- attr(df, "dropped_columns")
+    if (length(dropped) == 0) return(invisible())
+    msg <- sprintf(
+        "Ignored %d column(s) not used by FastRet: %s. They are not kept in the results.",
+        length(dropped), paste(dropped, collapse = ", ")
+    )
+    if (!is.null(shiny::getDefaultReactiveDomain())) {
+        shiny::showNotification(msg, type = "warning", duration = 10)
+    }
+    invisible(dropped)
 }
 
 validate_inputdata <- function(df,

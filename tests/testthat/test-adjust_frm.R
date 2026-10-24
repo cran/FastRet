@@ -23,7 +23,7 @@ test_that("adjust_frm merges by INCHIKEY when available", {
     new <- frm$df[idx, cols]
     new$RT <- new$RT + rnorm(nrow(new), mean = 3, sd = 0.5)  # Slightly perturb RTs
 
-    # Run adjustment; this should use INCHIKEY+SMILES and not error
+    # Run adjustment; this should use INCHIKEY (the default when available) and not error
     afm <- adjust_frm(frm, new, nfolds = 2, verbose = 0, seed = 42, predictors = 1)
     afm42 <- adjust_frm(frm, new, nfolds = 2, verbose = 0, seed = 42, predictors = 1)
     afm99 <- adjust_frm(frm, new, nfolds = 2, verbose = 0, seed = 99, predictors = 1)
@@ -38,7 +38,7 @@ test_that("adjust_frm merges by INCHIKEY when available", {
     expect_equal(new$RT, afm$adj$df$RT_ADJ)
 
     # Ensure that afm$adj$df$RT is calculated correctly by mapping to frm$df via
-    # INCHIKEY+SMILES and averaging RT over duplicates.
+    # INCHIKEY and averaging RT over duplicates.
     n <- length(idx)
     old <- afm$df[idx, ] # (1)
     old$RT[c(1, n)] <- mean(afm$df$RT[1:5]) # (2)
@@ -50,7 +50,7 @@ test_that("adjust_frm merges by INCHIKEY when available", {
     # these elements to be picked as corresponding "old" measurements, that will
     # be adjusted.
     # (2) However, because the first and last entry in `new` have the same
-    # INCHIKEY+SMILES combination as the first five entries in `afm$df` (3), our
+    # INCHIKEY (and here also SMILES) as the first five entries in `afm$df` (3), our
     # algorithm should calculate the average retention time over `afm$df[1:5,]`
     # and then map both `new[1,]` and `new[n,]` to that average.
 
@@ -62,7 +62,7 @@ test_that("adjust_frm merges by INCHIKEY when available", {
 
     # Now change a few NAMES as well, so that even the SMILES+NAME fallback
     # cannot find matches for all entries
-    new$NAME[8:10] <- NA
+    new$NAME[8:10] <- paste0("missing_", seq_len(3))
     expect_error(
         afm3 <- adjust_frm(frm, new, nfolds = 2, verbose = 0, seed = 42, predictors = 1),
         "Could not map 3 new entries"
@@ -76,6 +76,80 @@ test_that("adjust_frm merges by INCHIKEY when available", {
         plot_frm(afm, type = "scatter.cv.adj")
         par(mfrow = c(1, 1))
     }
+})
+
+
+test_that("adjust_frm can skip RT matching and use predictions", {
+
+    frm <- readRDS(pkg_file("extdata/RP_lasso_model.rds"))
+    idx <- seq(2, 200, by = 20)
+    new <- frm$df[idx, c("NAME", "SMILES", "RT")]
+    set.seed(19)
+    new$RT <- new$RT + runif(nrow(new), min = -0.2, max = 0.2)
+
+    base_preds <- predict(frm, df = new, adjust = FALSE, verbose = 0)
+    afm <- adjust_frm(
+        frm = frm,
+        new_data = new,
+        nfolds = 2,
+        verbose = 0,
+        seed = 19,
+        predictors = 1:2,
+        adj_type = "lasso",
+        match_rts = FALSE
+    )
+
+    expect_equal(afm$adj$df$RT, base_preds)
+    expect_equal(afm$adj$df$RT_ADJ, new$RT)
+    expect_false(afm$adj$args$match_rts)
+    expect_true(is.null(afm$adj$args$match_keys))
+    expect_equal(nrow(afm$adj$df), nrow(new))
+})
+
+
+test_that("resolve_match_keys defaults to INCHIKEY alone, else SMILES+NAME", {
+    with_ik    <- data.frame(SMILES = "C", NAME = "A", INCHIKEY = "AAA", RT = 1)
+    without_ik <- data.frame(SMILES = "C", NAME = "A", RT = 1)
+    na_ik      <- data.frame(SMILES = "C", NAME = "A", INCHIKEY = NA_character_, RT = 1)
+
+    # Complete INCHIKEY in both -> INCHIKEY alone (not SMILES+INCHIKEY)
+    expect_identical(resolve_match_keys(with_ik, with_ik, NULL), "INCHIKEY")
+    # Missing INCHIKEY column -> fall back to SMILES+NAME
+    expect_identical(resolve_match_keys(without_ik, without_ik, NULL), c("SMILES", "NAME"))
+    # NA INCHIKEY -> fall back to SMILES+NAME
+    expect_identical(resolve_match_keys(na_ik, na_ik, NULL), c("SMILES", "NAME"))
+    # Explicit match_keys still honored
+    expect_identical(resolve_match_keys(with_ik, with_ik, "SMILES"), "SMILES")
+})
+
+
+test_that("adjust_frm respects custom match_keys", {
+
+    frm <- readRDS(pkg_file("extdata/RP_lasso_model.rds"))
+    frm$df$INCHIKEY <- NULL
+    idx <- seq(3, 120, by = 15)
+    new <- frm$df[idx, c("NAME", "SMILES", "RT")]
+    new$NAME <- paste0(new$NAME, "__new")
+
+    expect_error(
+        adjust_frm(frm, new, nfolds = 2, verbose = 0, seed = 5),
+        regexp = "Could not map"
+    )
+
+    afm <- adjust_frm(
+        frm, new,
+        nfolds = 2,
+        verbose = 0,
+        seed = 5,
+        predictors = 1:2,
+        adj_type = "lasso",
+        match_keys = "SMILES"
+    )
+
+    expect_equal(nrow(afm$adj$df), nrow(new))
+    expect_identical(afm$adj$args$match_keys, "SMILES")
+    expect_true(all(afm$adj$df$SMILES == new$SMILES))
+    expect_equal(afm$adj$df$RT_ADJ, new$RT)
 })
 
 

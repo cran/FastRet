@@ -16,7 +16,9 @@ train_frm(
   rm_na = TRUE,
   rm_ns = FALSE,
   seed = NULL,
-  do_cv = TRUE
+  do_cv = TRUE,
+  cache = TRUE,
+  tune_grid = NULL
 )
 }
 \arguments{
@@ -54,6 +56,19 @@ reproducible results.}
 
 \item{do_cv}{A logical value indicating whether to perform cross-validation. If FALSE,
 the \code{cv} element in the returned object will be NULL.}
+
+\item{cache}{Cache chemical descriptors on disk (TRUE, default) or bypass the cache and
+recompute every descriptor (FALSE). Passed to \code{\link[=getCDs]{getCDs()}}.}
+
+\item{tune_grid}{Optional hyperparameter grid for \code{gbtree}/BRT models. Either a \code{data.frame} of
+xgboost hyperparameters (one combination per row, e.g. columns \code{max_depth},
+\code{eta}, \code{gamma}, \code{colsample_bytree}, \code{subsample}, \code{min_child_weight}) or one of
+the built-in grid-size keywords \code{"tiny"}, \code{"small"} or \code{"large"} (see
+\code{get_param_grid()}; \code{"small"} is a fast 8-combination Retip-style grid). When
+supplied, the fixed default parameters are replaced by a cross-validated grid
+search over the grid (via \code{find_params_best()}); the number of boosting rounds
+is still chosen by early stopping. Ignored (with a warning) for non-BRT
+methods. \code{NULL} (default) keeps the fast stock parameters.}
 }
 \value{
 A 'FastRet Model', i.e., an object of class \code{frm}. Components are:

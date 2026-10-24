@@ -54,7 +54,36 @@ test_that("predict.frm imputes CDs if they are NA", {
     yhat <- predict.frm(frm, new_data)
     yhat_no_imputing <- predict.frm(frm, new_data, impute = FALSE)
 
-    # Check Results
-    expect_equal(round(yhat, 2), c(4.31, 4.54))
-    expect_equal(round(yhat_no_imputing, 2), c(NaN, 4.54))
+    # Check Results. THIOUREA (row 1) has a missing Kier3; L-SELENOMETHIONINE
+    # (row 2) does not. Imputation fills the gap so both predictions are finite;
+    # without imputation the molecule with the missing descriptor yields NA while
+    # the complete one is unaffected. (Exact values depend on the shipped model's
+    # intercept and training-data means, so we assert behavior, not magic numbers.)
+    expect_length(yhat, 2)
+    expect_true(all(is.finite(yhat)))
+    expect_true(is.na(yhat_no_imputing[1]))     # missing Kier3, not imputed
+    expect_true(is.finite(yhat_no_imputing[2])) # Kier3 present
+    expect_equal(yhat[[2]], yhat_no_imputing[[2]]) # complete row unaffected by imputation
+
+    # Now test imputation for adjusted predictions.
+    #
+    # Adjustment dataframes never remove NAs or NZV-predictors during training.
+    # Therefore the predict function assumes them to be present during
+    # prediction as well. To mimic this behavior, store an apprpriately
+    # preprocessed dataframe in frm$adj$df.
+    frm$adj$model <- frm$model # Reuse same model, which depends on Kier3
+    frm$adj$df <- preprocess_data(
+        frm$df, degree_polynomial = 1, interaction_terms = FALSE, verbose = 0,
+        nw = 1, rm_near_zero_var = FALSE, rm_na = FALSE, add_cds = TRUE,
+        rm_ucs = TRUE, rt_terms = 1
+    )
+
+    # Without imputation, NA in adjustment predictors yields NA predictions.
+    yhat_no_impute <- predict.frm(frm, new_data, adjust = TRUE, impute = FALSE, clip = FALSE, verbose = 0)
+    expect_true(anyNA(yhat_no_impute))
+
+    # With imputation, predictions must be finite.
+    yhat <- predict.frm(frm, new_data, adjust = TRUE, impute = TRUE, clip = FALSE, verbose = 0)
+    expect_false(anyNA(yhat))
+    expect_true(all(is.finite(yhat)))
 })

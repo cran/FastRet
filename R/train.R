@@ -55,6 +55,20 @@
 #' @param do_cv
 #' A logical value indicating whether to perform cross-validation. If FALSE,
 #' the `cv` element in the returned object will be NULL.
+#' @param cache
+#' Cache chemical descriptors on disk (TRUE, default) or bypass the cache and
+#' recompute every descriptor (FALSE). Passed to [getCDs()].
+#'
+#' @param tune_grid
+#' Optional hyperparameter grid for `gbtree`/BRT models. Either a `data.frame` of
+#' xgboost hyperparameters (one combination per row, e.g. columns `max_depth`,
+#' `eta`, `gamma`, `colsample_bytree`, `subsample`, `min_child_weight`) or one of
+#' the built-in grid-size keywords `"tiny"`, `"small"` or `"large"` (see
+#' `get_param_grid()`; `"small"` is a fast 8-combination Retip-style grid). When
+#' supplied, the fixed default parameters are replaced by a cross-validated grid
+#' search over the grid (via `find_params_best()`); the number of boosting rounds
+#' is still chosen by early stopping. Ignored (with a warning) for non-BRT
+#' methods. `NULL` (default) keeps the fast stock parameters.
 #'
 #' @return
 #' A 'FastRet Model', i.e., an object of class `frm`. Components are:
@@ -82,13 +96,13 @@
 train_frm <- function(df, method = "lasso", verbose = 1, nfolds = 5, nw = 1,
                       degree_polynomial = 1, interaction_terms = FALSE,
                       rm_near_zero_var = TRUE, rm_na = TRUE, rm_ns = FALSE,
-                      seed = NULL, do_cv = TRUE) {
+                      seed = NULL, do_cv = TRUE, cache = TRUE, tune_grid = NULL) {
 
     # Check arguments
     stopifnot(
         is.data.frame(df),
         all(c("NAME", "RT", "SMILES") %in% colnames(df)),
-        method %in% c("lasso", "ridge", "gbtree", "gbtreeDefault", "gbtreeRP"),
+        is.character(method), length(method) == 1, !is.na(method),
         is.numeric(nfolds), nfolds >= 2,
         is.numeric(nw), nw >= 1,
         is.numeric(degree_polynomial), degree_polynomial >= 1,
@@ -97,12 +111,19 @@ train_frm <- function(df, method = "lasso", verbose = 1, nfolds = 5, nw = 1,
         is.logical(rm_na),
         is.logical(rm_ns),
         is.null(seed) || (is.numeric(seed) && length(seed) == 1),
-        is.logical(do_cv)
+        is.logical(do_cv),
+        is.null(tune_grid) || is.data.frame(tune_grid) ||
+            (is.character(tune_grid) && length(tune_grid) == 1)
     )
 
     # Init variables
+    method <- normalize_train_method(method)
     if (is.numeric(seed)) set.seed(seed)
     if (method == "gbtree") method <- "gbtreeDefault"
+    if (!is.null(tune_grid) && !method %in% c("gbtreeDefault", "gbtreeRP")) {
+        warning("'tune_grid' is only used for gbtree (BRT) models; ignoring it.")
+        tune_grid <- NULL
+    }
     args <- named(
         method, verbose, nfolds, nw, degree_polynomial,
         interaction_terms, rm_near_zero_var,
@@ -112,18 +133,21 @@ train_frm <- function(df, method = "lasso", verbose = 1, nfolds = 5, nw = 1,
     dgp <- degree_polynomial
     iat <- interaction_terms
     rm_nzv <- rm_near_zero_var
-    df <- preprocess_data(df, 1, FALSE, verbose, nw, FALSE, FALSE)
+    df <- preprocess_data(df, 1, FALSE, verbose, nw, FALSE, FALSE, cache = cache)
     # Only add CDs, but don't do any transformations yet, as this is part of
     # model training
 
     logf("Training a FastRet model with %s base", method)
-    dfp <- preprocess_data(df, dgp, iat, verbose, nw, rm_nzv, rm_na)
+    dfp <- preprocess_data(df, dgp, iat, verbose, nw, rm_nzv, rm_na, cache = cache)
     meta <- which(colnames(dfp) %in% c("NAME", "SMILES", "RT", "INCHIKEY"))
     M <- dfp[, meta]
     X <- as.matrix(dfp[, -meta])
     y <- M$RT
     model <- if (method %in% c("gbtreeDefault", "gbtreeRP")) {
-        xgpar <- if (method == "gbtreeDefault") "default" else "rpopt"
+        # tune_grid (a data.frame of xgboost parameters) overrides the default /
+        # RP-optimised fixed parameters with a cross-validated grid search.
+        xgpar <- if (!is.null(tune_grid)) tune_grid
+                 else if (method == "gbtreeDefault") "default" else "rpopt"
         fit_gbtree(X, y, xgpar, seed, verbose, nw, nfolds, 2000, 1)
     } else {
         fit_glmnet(X, y, method, seed)
@@ -146,18 +170,6 @@ train_frm <- function(df, method = "lasso", verbose = 1, nfolds = 5, nw = 1,
             degree_polynomial = dgp, interaction_terms = iat,
             rm_near_zero_var = rm_nzv, rm_na = rm_na, rm_ns = rm_ns,
             seed = seed, do_cv = FALSE
-        )
-
-        m <- models[[1]]
-        toscutil::stub(
-            predict.frm,
-            object = models[[1]],
-            df = test_dfs[[1]],
-            adjust = NULL,
-            verbose = 0,
-            clip = TRUE,
-            impute = TRUE,
-            ... = list()
         )
 
         preds_per_fold <- mapply(predict.frm, models, test_dfs, SIMPLIFY = FALSE)
@@ -209,12 +221,31 @@ train_frm <- function(df, method = "lasso", verbose = 1, nfolds = 5, nw = 1,
 #' A logical value indicating whether to add chemical descriptors as predictors
 #' to new data. Default is TRUE if `adj_type` is "lasso", "ridge" or "gbtree"
 #' and FALSE if `adj_type` is "lm".
+#' @param match_rts
+#' Logical indicating how to obtain the RT feature used during training of the
+#' adjustment model. If TRUE (default), RT is obtained by matching rows in
+#' `new_data` to rows in `frm$df` based on `match_keys`. If FALSE, RT is obtained
+#' by applying the base model to `new_data`.
+#' @param match_keys
+#' Which columns to use for matching `new_data` to `frm$df` if `match_rts` is
+#' TRUE. Can be any combination of "INCHIKEY", "SMILES" and "NAME". If left at
+#' NULL, matching is done via `"INCHIKEY"` alone if complete INCHIKEYs are
+#' available in both `new_data` and `frm$df`, else via `c("SMILES", "NAME")`.
+#' INCHIKEY is a structure-invariant identifier, so it alone uniquely identifies
+#' a molecule; adding SMILES (matched as an exact raw string) would only make the
+#' key more fragile. See 'Details' for more information on the matching procedure.
+#' @param cache
+#' Cache chemical descriptors on disk (TRUE, default) or bypass the cache and
+#' recompute every descriptor (FALSE). Passed to [getCDs()].
 #'
 #' @details
-#' Matching is done via "SMILES"+"INCHIKEY" if both datasets have non-missing
-#' INCHIKEYs for all rows; otherwise via "SMILES"+"NAME". If multiple rows in
-#' `frm$df` match the same row in `new_data`, their RT values are averaged
-#' first, and this average is used for training the adjustment model.
+#' Matching is done via `"INCHIKEY"` alone if both datasets have non-missing
+#' INCHIKEYs for all rows; otherwise via `c("SMILES", "NAME")`. This can be
+#' overridden by supplying `match_keys`. If `match_rts = FALSE`, no matching is
+#' performed and retention times are generated by calling `predict(frm, new_data,
+#' adjust = FALSE)`. If multiple rows in `frm$df` match the same row in
+#' `new_data`, their RT values are averaged first, and this average is used for
+#' training the adjustment model.
 #'
 #' Example: if `frm$df` equals data.frame OLD shown below and `new_data` equals
 #' data.frame NEW, then the resulting, paired data.frame will look like PAIRED.
@@ -282,7 +313,7 @@ train_frm <- function(df, method = "lasso", verbose = 1, nfolds = 5, nw = 1,
 #' frm <- read_rp_lasso_model_rds()
 #' new_data <- read_rpadj_xlsx()
 #' frm_adj <- adjust_frm(frm, new_data, verbose = 0)
-#'
+#' frm_adj <- adjust_frm(frm, new_data, verbose = 0, adj_type = "lasso")
 adjust_frm <- function(frm,
                        new_data,
                        predictors = 1:6,
@@ -291,7 +322,10 @@ adjust_frm <- function(frm,
                        seed = NULL,
                        do_cv = TRUE,
                        adj_type = "lm",
-                       add_cds = NULL) {
+                       add_cds = NULL,
+                       match_rts = TRUE,
+                       match_keys = NULL,
+                       cache = TRUE) {
 
     # Stubs for interactive Development
     if (FALSE) {
@@ -309,16 +343,20 @@ adjust_frm <- function(frm,
         is.logical(verbose) || is.numeric(verbose),
         is.null(seed) || is.numeric(seed),
         is.logical(do_cv),
-        is.character(adj_type), adj_type %in% c("lm", "lasso", "ridge", "gbtree"),
-        is.null(add_cds) || is.logical(add_cds)
+        is.character(adj_type), length(adj_type) == 1, !is.na(adj_type),
+        is.null(add_cds) || is.logical(add_cds),
+        is.logical(match_rts), length(match_rts) == 1, !is.na(match_rts),
+        is.null(match_keys) || (is.character(match_keys) && length(match_keys) >= 1 &&
+            all(match_keys %in% c("INCHIKEY", "SMILES", "NAME")))
     )
-    if (length(predictors) == 1 && predictors != 7 && adj_type != "lm") {
+    adj_type <- normalize_adj_type(adj_type)
+    if (is.null(seed)) seed <- sample.int(.Machine$integer.max, 1)
+    if (is.null(add_cds)) add_cds <- if (adj_type == "lm") FALSE else TRUE
+    if (length(predictors) == 1 && isFALSE(add_cds) && adj_type != "lm") {
         fmt <- "Adjustment via '%s' requires 2+ predictors. Setting 'adj_type' to 'lm'."
         warning(sprintf(fmt, adj_type))
         adj_type <- "lm"
     }
-    if (is.null(seed)) seed <- sample.int(.Machine$integer.max, 1)
-    if (is.null(add_cds)) add_cds <- if (adj_type == "lm") FALSE else TRUE
 
     # Configure logging
     logf <- if (verbose >= 1) catf else null
@@ -335,18 +373,18 @@ adjust_frm <- function(frm,
 
     # Map new and old data
     logf("Mapping new and old data")
-    args <- named(predictors, nfolds, verbose, seed, do_cv, adj_type)
-    df <- merge_dfs(old = frm$df, new = new_data)
+    args <- named(predictors, nfolds, verbose, seed, do_cv, adj_type, match_rts, match_keys)
+    df <- build_adjustment_df(frm, new_data, match_rts, match_keys)
     df <- preprocess_data(
         df, degree_polynomial = 1, interaction_terms = FALSE, verbose = verbose,
         nw = 1, rm_near_zero_var = FALSE, rm_na = FALSE, add_cds = add_cds,
-        rm_ucs = TRUE, rt_terms = predictors
+        rm_ucs = TRUE, rt_terms = predictors, cache = cache
     )
     frm$adj <- named(model = NULL, df = df, cv = NULL, args = args)
 
     # Train adjustment model
     logf("Training adjustment model with %s base", adj_type)
-    dfp <- preprocess_data(df, 1, FALSE, verbose, 1, TRUE, TRUE, FALSE, FALSE)
+    dfp <- preprocess_data(df, 1, FALSE, verbose, 1, TRUE, TRUE, FALSE, FALSE, cache = cache)
     meta <- match(c("NAME", "SMILES", "INCHIKEY", "RT_ADJ"), colnames(df))
     meta <- meta[!is.na(meta)]
     M <- dfp[, meta]
@@ -373,6 +411,7 @@ adjust_frm <- function(frm,
         models <- mapply(
             adjust_frm, list(frm), train_dfs, list(predictors),
             nfolds, verbose, seeds, FALSE, adj_type,
+            MoreArgs = list(add_cds = add_cds, match_rts = match_rts, match_keys = match_keys),
             SIMPLIFY = FALSE, USE.NAMES = FALSE
         )
         dbgf("Predicting RT_ADJ for hold-out data in each fold")
@@ -461,6 +500,8 @@ print.frm <- function(x, ...) {
 #' @param verbose A logical value indicating whether to print progress messages.
 #' @param clip Clip predictions to be within RT range of training data?
 #' @param impute Impute missing predictor values using column means of training data?
+#' @param cache Cache chemical descriptors on disk (TRUE, default) or bypass the
+#' cache and recompute every descriptor (FALSE). Passed to [getCDs()].
 #' @param ... Not used. Required to match the generic signature of `predict()`.
 #'
 #' @return
@@ -478,6 +519,7 @@ predict.frm <- function(object = train_frm(),
                         verbose = 0,
                         clip = TRUE,
                         impute = TRUE,
+                        cache = TRUE,
                         ...) {
 
     # Load required packages
@@ -486,9 +528,9 @@ predict.frm <- function(object = train_frm(),
 
     # Init locals
     logf <- if (verbose >= 1) catf else null
-    cd_pds <- get_predictors(object, base = TRUE, adjust = FALSE)
-    dgp <- get_dgp(cd_pds)
-    iat <- any(grepl(":", cd_pds))
+    pds <- get_predictors(object, base = TRUE, adjust = FALSE)
+    dgp <- get_dgp(pds)
+    iat <- any(grepl(":", pds))
     rm_nzv <- FALSE
     rm_na <- FALSE
     add_cds <- TRUE
@@ -498,47 +540,40 @@ predict.frm <- function(object = train_frm(),
         errmsg <- "Model has not been adjusted yet. Please adjust the model first using `adjust_frm()`."
         stop(errmsg)
     }
-    if (!all(cd_pds %in% colnames(df))) {
-        logf("Chemical descriptors not found in newdata. Trying to calculate them from the provided SMILES.")
+    if (!all(pds %in% colnames(df))) {
+        logf("Obtaining the required chemical descriptors from the provided SMILES.")
         df <- preprocess_data(
             df, dgp, iat, verbose, 1, rm_nzv, rm_na, add_cds,
-            rm_ucs = TRUE, rt_terms = 1, mandatory = c("NAME", "SMILES")
+            rm_ucs = TRUE, rt_terms = 1, mandatory = c("NAME", "SMILES"), cache = cache
         )
 
     }
-    if (!all(cd_pds %in% colnames(df))) {
-        missing <- paste(setdiff(cd_pds, colnames(df)), collapse = ", ")
-        errmsg <- paste("The following cd_pds are missing in `df`: ", missing)
+    if (!all(pds %in% colnames(df))) {
+        missing <- paste(setdiff(pds, colnames(df)), collapse = ", ")
+        errmsg <- paste("The following predictors are missing in `df`: ", missing)
         stop(errmsg)
     }
 
     # Impute missing values
-    if (impute && any(is.na(df[, cd_pds]))) {
-        nap <- cd_pds[colSums(is.na(df[, cd_pds])) > 0]
-        napstr <- paste(nap, collapse = ", ")
-        logf("NA values found for following cd_pds: %s", napstr)
-        logf("Replacing NA values by column means of training data")
+    if (impute) {
         train_df <- object$df
-        if (!all(cd_pds %in% colnames(train_df))) {
+        if (!all(pds %in% colnames(train_df))) {
             # We don't store interaction terms and/or polynomial features in
             # the training data frame, so we need to preprocess it again to get
-            # these features.
+            # these features, if they are required for imputation.
             train_df <- preprocess_data(
                 train_df, dgp, iat, verbose,
                 nw = 1, rm_near_zero_var = FALSE, rm_na = FALSE, add_cds = TRUE,
-                rm_ucs = TRUE, rt_terms = 1, mandatory = c("NAME", "SMILES")
+                rm_ucs = TRUE, rt_terms = 1, mandatory = c("NAME", "SMILES"), cache = cache
             )
         }
-        for (p in nap) {
-            col_mean <- mean(train_df[[p]], na.rm = TRUE)
-            df[[p]][is.na(df[[p]])] <- col_mean
-        }
+        df <- impute_missing_predictors(df, pds, train_df, logf)
     }
 
     # Predict retention times using base model
     adjust <- !is.null(object$adj) && (isTRUE(adjust) || is.null(adjust))
     logf("Predicting retention times")
-    yhat <- as.numeric(predict(object$model, as.matrix(df[, cd_pds])))
+    yhat <- as.numeric(predict(object$model, as.matrix(df[, pds])))
 
     # Adjust predictions if requested
     if (adjust) {
@@ -554,10 +589,15 @@ predict.frm <- function(object = train_frm(),
             adj_df <- preprocess_data(
                 data = adj_df, verbose = verbose, rm_near_zero_var = FALSE,
                 rm_na = FALSE, add_cds = add_cds, rm_ucs = FALSE,
-                rt_terms = adj_rtts
+                rt_terms = adj_rtts, cache = cache
             )
         }
         adj_df <- adj_df[, adj_pds, drop = FALSE]
+
+        # Impute missing values for adjustment predictors (can happen for
+        # exotic compounds where CD calculation fails for a few features).
+        if (impute) adj_df <- impute_missing_predictors(adj_df, adj_pds, object$adj$df, logf)
+
         X_adj <- if (inherits(object$adj$model, "lm")) adj_df else as.matrix(adj_df)
         x <- try(yhat <- as.numeric(predict(object$adj$model, X_adj)))
     }
@@ -571,6 +611,37 @@ predict.frm <- function(object = train_frm(),
 
     # Return predictions
     as.numeric(yhat)
+}
+
+impute_missing_predictors <- function(df, pds, train_df, logf = null) {
+    if (length(pds) == 0) return(df)
+    if (!all(pds %in% colnames(df))) {
+        missing <- paste(setdiff(pds, colnames(df)), collapse = ", ")
+        stop(sprintf("The following predictors are missing in `df`: %s", missing))
+    }
+    if (!all(pds %in% colnames(train_df))) {
+        missing <- paste(setdiff(pds, colnames(train_df)), collapse = ", ")
+        fmt <- "Required predictors missing in training data: %s. This indicates a model/training-data mismatch."
+        stop(sprintf(fmt, missing))
+    }
+
+    bad <- !is.finite(as.matrix(df[, pds, drop = FALSE]))
+    if (any(bad)) df[, pds][bad] <- NA
+    if (!anyNA(df[, pds, drop = FALSE])) return(df)
+
+    nap <- pds[colSums(is.na(df[, pds, drop = FALSE])) > 0]
+    if (length(nap) == 0) return(df)
+
+    logf("NA values found for following predictors: %s", paste(nap, collapse = ", "))
+    logf("Replacing NA values by column means of training data")
+
+    for (p in nap) {
+        col_mean <- mean(train_df[[p]], na.rm = TRUE)
+        if (!is.finite(col_mean) || is.na(col_mean)) col_mean <- 0
+        df[[p]][is.na(df[[p]])] <- col_mean
+    }
+
+    df
 }
 
 get_req_pkgs <- function(frm) {
@@ -690,110 +761,192 @@ clip_predictions <- function(yhat, y) {
     yhat
 }
 
-# Preprocessing #####
+# Helpers #####
+
+normalize_train_method <- function(method) {
+    stopifnot(is.character(method), length(method) == 1, !is.na(method))
+    igrepl <- function(pattern, x) grepl(pattern, x, ignore.case = TRUE)
+    if (igrepl("^(lasso)$", method)) return("lasso")
+    if (igrepl("^(ridge)$", method)) return("ridge")
+    if (igrepl("^(gbtree|gbtreeDefault|BRT)$", method)) return("gbtree")
+    if (igrepl("^(gbtreeRP|BRTRP)$", method)) return("gbtreeRP")
+    fmt <- "Invalid method '%s'. Allowed values: lasso, ridge, gbtree, gbtreeRP."
+    stop(sprintf(fmt, method))
+}
+
+normalize_adj_type <- function(adj_type) {
+    stopifnot(is.character(adj_type), length(adj_type) == 1, !is.na(adj_type))
+    igrepl <- function(pattern, x) grepl(pattern, x, ignore.case = TRUE)
+    if (igrepl("^(lm)$", adj_type)) return("lm")
+    if (igrepl("^(lasso)$", adj_type)) return("lasso")
+    if (igrepl("^(ridge)$", adj_type)) return("ridge")
+    if (igrepl("^(gbtree|gbtreeDefault|BRT)$", adj_type)) return("gbtree")
+    fmt <- "Invalid adj_type '%s'. Allowed values: lm, lasso, ridge, gbtree."
+    stop(sprintf(fmt, adj_type))
+}
 
 #' @noRd
-#' @title Merge training and adjustment data.frames
+#' @title Build adjustment data
 #' @description
-#' Merges the original data frame used to train a FastRet model with a new
-#' data frame provided by the user for adjusting the original model.
+#' Creates the data.frame used to train an adjustment model either by matching
+#' the new measurements against the original training data or by predicting the
+#' missing RTs with the base model.
 #'
-#' @param old The original data frame used to train `frm`. Must contain columns
-#' "NAME", "SMILES", "RT" and optionally "INCHIKEY" as well the chemical
-#' descriptors listed in `CDFeatures`
-#' @param new The new data frame provided by the user. Must contain columns
-#' "NAME", "SMILES", "RT" and optionally "INCHIKEY".
+#' @param frm FastRet model that provides the original training data and base model.
+#' @param new The new adjustment data frame.
+#' @param match_rts Logical indicating whether RTs should be taken from
+#' `frm$df` via matching.
+#' @param match_keys Character vector with the columns used for matching.
 #'
-#' @return A data frame with following columns:
-#' - NAME: Molecule names from `new`
-#' - SMILES: Molecule SMILES from `new`
-#' - RT: Corresponding retention times taken from `old`
-#' - RT_ADJ: Retention times from `new`
+#' @return A data.frame containing NAME, SMILES, optional INCHIKEY, RT, and RT_ADJ.
 #'
 #' @examples
-#' new <- data.frame(
-#'     NAME   = c("A", "B",  "B",  "B"),
-#'     SMILES = c("C", "CC", "CC", "CC"),
-#'     RT     = c(2.5,  5.5,  5.7,  5.6)
-#' )
-#' old <- data.frame(
-#'      NAME   = c("A", "B",  "B",  "C"),
-#'      SMILES = c("C", "CC", "CC", "CCC"),
-#'      RT     = c(5.0,  8.0,  8.2,  9.0),
-#'      nAtom  = c(1,    2,    2,    3)
-#' )
-#' merged <- merge_dfs(old, new)
-#' print(merged)
-#' ## data.frame(
-#' ##      NAME = c("A", "B", "B", "B"),
-#' ##      SMILES = c("C", "CC", "CC", "CC"),
-#' ##      RT_ADJ = c(2.5, 5.5, 5.7, 5.6),
-#' ##      RT = c(5, 8.1, 8.1, 8.1),
-#' ##      nAtom = c(1, 2, 2, 2)
-#' ## )
-merge_dfs <- function(old, new) {
-    use_inchi <- {
-        !is.null(old$INCHIKEY) && all(!is.na(old$INCHIKEY)) &&
-        !is.null(new$INCHIKEY) && all(!is.na(new$INCHIKEY))
+#' frm <- read_rp_lasso_model_rds()
+#' new_data <- read_rpadj_xlsx()[1:3, ]
+#' build_adjustment_df(frm, new_data, match_rts = TRUE)
+build_adjustment_df <- function(frm, new, match_rts = TRUE, match_keys = NULL) {
+    df <- data.frame(NAME = new$NAME, SMILES = new$SMILES, RT_ADJ = new$RT)
+    if ("INCHIKEY" %in% colnames(new)) {
+        df$INCHIKEY <- new$INCHIKEY
     }
-    if (use_inchi) {
-        new <- data.frame(
-            NAME = new$NAME,
-            INCHIKEY = new$INCHIKEY,
-            SMILES = new$SMILES,
-            RT_ADJ = new$RT,
-            KEY = paste0(new$SMILES, "_", new$INCHIKEY)
-        )
-        old <- data.frame(
-            RT = old$RT,
-            KEY = paste0(old$SMILES, "_", old$INCHIKEY)
-        )
-    } else {
-        new <- data.frame(
-            NAME = new$NAME,
-            SMILES = new$SMILES,
-            RT_ADJ = new$RT,
-            KEY = paste0(new$SMILES, "_", new$NAME)
-        )
-        old <- data.frame(
-            RT = old$RT,
-            KEY = paste0(old$SMILES, "_", old$NAME)
-        )
+    if (!match_rts) {
+        df$RT <- as.numeric(predict(frm, new, adjust = FALSE, verbose = 0))
+        return(df)
     }
-    old <- old[old$KEY %in% unique(new$KEY), ]
-
-    # At this point, we can still have multiple measurements per KEY in old. To
-    # deal with this, we average their RTs first, then map every new entry to
-    # the average.
-    old_RT_avgs <- tapply(old$RT, old$KEY, mean)
-    old <- old[!duplicated(old$KEY), ]
-    old$RT <- as.numeric(old_RT_avgs[old$KEY]) # as.numeric drops dimnames attr
-
-    # Now finally merge new and old data to get the paired data.frame for model
-    # fitting. Make sure to restore the original order after merging, as
-    # `merge()` returns rows in an 'unspecified' order (even with sort=FALSE).
-    new$ID <- seq_len(nrow(new))
-    df <- merge(new, old, by = "KEY", sort = FALSE, all = FALSE)
-    df <- df[order(df$ID), ]
+    keys <- resolve_match_keys(frm$df, new, match_keys)
+    df$KEY <- build_match_key(new, keys, "new data")
+    df$ID <- seq_len(nrow(df))
+    key <- build_match_key(frm$df, keys, "original data")
+    old <- data.frame(RT = frm$df$RT, KEY = key)
+    old <- old[old$KEY %in% unique(df$KEY), , drop = FALSE]
+    if (!nrow(old)) {
+        key_str <- paste(keys, collapse = "+")
+        fmt <- "Could not map any new entries to original data based on %s."
+        stop(sprintf(fmt, key_str))
+    }
+    rt_avg <- tapply(old$RT, old$KEY, mean)
+    old <- old[!duplicated(old$KEY), , drop = FALSE]
+    old$RT <- as.numeric(rt_avg[old$KEY])
+    df <- merge(df, old, by = "KEY", all = FALSE, sort = FALSE)
+    df <- df[order(df$ID), , drop = FALSE]
     df$ID <- NULL
     df$KEY <- NULL
-
     if (nrow(df) < nrow(new)) {
-        key <- if (use_inchi) "SMILES+INCHIKEY" else "SMILES+NAME"
+        key_str <- paste(keys, collapse = "+")
+        miss <- nrow(new) - nrow(df)
         fmt <- "Could not map %d new entries to original data based on %s."
-        stop(sprintf(fmt, nrow(new) - nrow(df), key))
-    } else if (nrow(df) > nrow(new)) {
-        # This can't happen due to averaging above. We check anyway to be safe.
-        msg <- sprintf("Ambiguous mapping: %d new -> %d old", nrow(new), nrow(df))
-        stop(msg)
+        stop(sprintf(fmt, miss, key_str))
     }
     df
+}
+
+#' @noRd
+#' @title Resolve match keys
+#' @description Determine which columns should be used to match `new` against the training data.
+#' @param old Original training data stored in `frm$df`.
+#' @param new New adjustment data frame.
+#' @param match_keys Optional character vector supplied by the caller.
+#' @return Character vector of column names used for matching.
+#' @examples
+#' old <- data.frame(SMILES = "C", NAME = "A", INCHIKEY = "AAA", RT = 1)
+#' new <- data.frame(SMILES = "C", NAME = "A", INCHIKEY = "AAA", RT = 2)
+#' resolve_match_keys(old, new, NULL)                # "INCHIKEY"
+#' resolve_match_keys(old, new, c("SMILES", "NAME")) # c("SMILES", "NAME")
+#' resolve_match_keys(old, new, c("SMILES", "FOO"))  # error
+resolve_match_keys <- function(old, new, match_keys) {
+    allowed <- c("INCHIKEY", "SMILES", "NAME")
+    keys <- if (is.null(match_keys)) {
+        has_inchi <- ("INCHIKEY" %in% colnames(old)) &&
+            ("INCHIKEY" %in% colnames(new)) &&
+            all(!is.na(old$INCHIKEY)) &&
+            all(!is.na(new$INCHIKEY))
+        # INCHIKEY is a structure-invariant identifier, so it alone uniquely
+        # identifies a molecule. This matches how the FastRet paper's adjustment
+        # benchmarks map compounds. We deliberately do NOT add SMILES to the key:
+        # FastRet matches SMILES as exact raw strings, and the same compound often
+        # has different SMILES spellings across datasets, which would make the key
+        # unnecessarily fragile. When INCHIKEY is unavailable we fall back to
+        # SMILES+NAME, the strongest identifier pair that remains.
+        if (has_inchi) "INCHIKEY" else c("SMILES", "NAME")
+    } else {
+        invalid <- setdiff(match_keys, allowed)
+        if (length(invalid)) {
+            fmt <- "Invalid match_keys supplied: %s"
+            stop(sprintf(fmt, paste(invalid, collapse = ", ")))
+        }
+        match_keys
+    }
+    ensure_cols_exist(old, keys, "original data")
+    ensure_cols_exist(new, keys, "new data")
+    ensure_no_NAs(old, keys, "original data")
+    ensure_no_NAs(new, keys, "new data")
+    keys
+}
+
+#' @noRd
+#' @title Build composite match key
+#' @description Concatenate selected columns to create deterministic match keys.
+#' @param df Data frame containing the columns of interest.
+#' @param cols Character vector with column names used in the key.
+#' @param label Short label used in error messages.
+#' @return Character vector with unique keys per row.
+#' @examples
+#' df <- data.frame(SMILES = c("C", "CC"), NAME = c("A", "B"))
+#' build_match_key(df, c("SMILES", "NAME"), "demo")
+#' ##
+build_match_key <- function(df, cols, label) {
+    parts <- lapply(cols, function(col) df[[col]])
+    parts <- lapply(parts, as.character)
+    key <- do.call(paste, c(parts, list(sep = "__")))
+    if (any(is.na(key))) {
+        fmt <- "Missing values detected while creating %s keys."
+        stop(sprintf(fmt, label))
+    }
+    key
+}
+
+#' @noRd
+#' @title Ensure required columns are present
+#' @description Stop with an informative message when required matching columns are missing.
+#' @param df Data frame to inspect.
+#' @param cols Character vector with required columns.
+#' @param label Text describing the data frame (e.g. "new data").
+#' @examples
+#' ensure_cols_exist(data.frame(SMILES = "C"), "SMILES", "demo")
+ensure_cols_exist <- function(df, cols, label) {
+    missing <- setdiff(cols, colnames(df))
+    if (length(missing)) {
+        fmt <- "%s missing columns required for matching: %s"
+        stop(sprintf(fmt, label, paste(missing, collapse = ", ")))
+    }
+}
+
+#' @noRd
+#' @title Ensure matching columns have no missing values
+#' @description Validate that the supplied columns do not contain `NA`s before matching.
+#' @param df Data frame to inspect.
+#' @param cols Character vector with required columns.
+#' @param label Text describing the data frame (e.g. "original data").
+#' @examples
+#' ensure_no_NAs(data.frame(SMILES = "C"), "SMILES", "demo")
+ensure_no_NAs <- function(df, cols, label) {
+    has_na <- sapply(cols, function(col) any(is.na(df[[col]])))
+    if (any(has_na)) {
+        cols_na <- cols[has_na]
+        fmt <- "Columns %s contain NA values in %s."
+        stop(sprintf(fmt, paste(cols_na, collapse = ", "), label))
+    }
 }
 
 #' @noRd
 #' @description Get RMSE, Rsquared, MAE and %below1min for a specific dataset and model.
 #' @param data dataframe with retention time in the first column
 #' @param model object useable as input for [predict()]
+#' @examples
+#' df <- data.frame(RT = c(1, 2))
+#' df[[CDFeatures[1]]] <- c(0.3, 0.8)
+#' lm_mod <- stats::lm(RT ~ ., data = df)
+#' get_stats(df, lm_mod)
 get_stats <- function(df, model) {
     X <- as.matrix(df[, colnames(df) %in% CDFeatures])
     y <- df$RT
@@ -881,12 +1034,16 @@ fit_glmnet <- function(X, y = NULL, method = "lasso", seed = NULL) {
 fit_gbtree <- function(X, y, xgpar = "rpopt", seed = NULL, verbose = 1,
                        nw = 1, nfolds = 10, nrounds = 2000, nthread = 1) {
     if (is.numeric(seed)) set.seed(seed)
-    params <- switch(
-        xgpar,
+    # `xgpar` selects the xgboost parameters: "default" (stock), "rpopt" (the
+    # RP-optimised fixed set), a grid-size keyword ("tiny"/"small"/"large"), or a
+    # data.frame giving a custom parameter grid -- the latter two trigger a
+    # cross-validated grid search via find_params_best().
+    params <- if (is.data.frame(xgpar) ||
+                  (is.character(xgpar) && !xgpar %in% c("default", "rpopt"))) {
+        as.list(find_params_best(X, y, xgpar, nfolds, nw, nthread, nrounds, verbose, seed)$best_params)
+    } else switch(xgpar,
         "default" = list(),
-        "rpopt" = list(eta = 0.05, max_depth = 4, min_child_weight = 4, subsample = 0.5),
-        find_params_best(X, y, xgpar, nfolds, nw, nthread, nrounds, verbose, seed)$best_params
-    )
+        "rpopt" = list(eta = 0.05, max_depth = 4, min_child_weight = 4, subsample = 0.5))
     params$nthread <- nthread
     params$objective <- "reg:squarederror"
     Xmat <- as.matrix(X)
@@ -967,12 +1124,11 @@ find_params_best <- function(
         FUN = function(i) {
             logf(sprintf("Evaluating parameter set %d/%d", i, nparams))
             cv_obj <- xgboost::xgb.cv(
-                params = as.list(param_grid[i, ]),
+                params = c(as.list(param_grid[i, ]), objective = "reg:squarederror"),
                 data = xgboost::xgb.DMatrix(X_mat, label = y, nthread = nthread),
                 nrounds = nrounds,
                 folds = foldids,
                 early_stopping_rounds = 20,
-                objective = "reg:squarederror",
                 verbose = if (verbose == 2) TRUE else FALSE
             )
             niter <- cv_obj$niter
@@ -1047,10 +1203,19 @@ plot_params_perf <- function(x = fit_gbtree(),
 #' @noRd
 #' @title Get parameter grid
 #' @description
-#' Get the parameter grid for [find_params_best()].
+#' Get the parameter grid for `find_params_best()`.
 #' @param size Size of the param grid. Either "tiny", "small" or "large".
+#'   "small" mirrors the conservative grid used by the Retip package's
+#'   `fit.xgboost()` (minus the number of boosting rounds, which FastRet chooses
+#'   by early stopping) -- 8 combinations that finish in a few seconds and, in the
+#'   JCIM benchmark, match Retip's own grid search.
 #' @return A dataframe with a unique combination of parameters per row.
 get_param_grid <- function(size = "large", nthread = NULL) {
+    # A data.frame is taken as an explicit, user-supplied parameter grid.
+    if (is.data.frame(size)) {
+        if (!is.null(nthread)) size$nthread <- nthread
+        return(size)
+    }
     space <- if (size == "large") list(
         max_depth = 1:6, # max depth of a tree
         eta = c(0.01, 0.02, 0.05, 0.10, 0.20, 0.30, 0.40), # learning rate
@@ -1059,8 +1224,14 @@ get_param_grid <- function(size = "large", nthread = NULL) {
         subsample = (4:10) / 10, # subsample ratio of the training instance
         min_child_weight = 1:5 # minimum number of instances needed to be in each node
     ) else if (size == "small") list(
-        max_depth = 3:6,
-        eta = c(0.10, 0.20, 0.30, 0.40)
+        # Retip's xgboost grid (Retip::fit.xgboost) minus nrounds (early-stopped
+        # by FastRet): 4 x 2 = 8 combinations, a fast but effective search.
+        max_depth = c(2, 3, 4, 5),
+        eta = c(0.01, 0.02),
+        gamma = 1,
+        colsample_bytree = 0.5,
+        min_child_weight = 10,
+        subsample = 0.5
     ) else if (size == "tiny") list(
         eta = c(0.10, 0.20, 0.30, 0.40)
     ) else {
@@ -1072,7 +1243,7 @@ get_param_grid <- function(size = "large", nthread = NULL) {
 
 #' @noRd
 #' @description
-#' Calls [find_params_best()] multiple times with different numbers of workers
+#' Calls `find_params_best()` multiple times with different numbers of workers
 #' and threads to benchmark runtime of the grid search with respect to these two
 #' parameters.
 #' @examples

@@ -1,3 +1,312 @@
+# FastRet 1.5.2
+
+This is the first CRAN release since 1.3.0.
+It includes all changes listed below for versions 1.3.1 to 1.5.1, notably the 1.3.7 fix: cross-validation in `train_frm()` no longer requires the suggested package `toscutil`, so model training no longer fails in a plain CRAN install without Suggests packages.
+
+Changes in this version:
+
+- Replaced a `structure(.Names = )` call in the GUI server code with `stats::setNames()`, fixing the R-devel CRAN check NOTE about deprecated special names.
+
+- The xgboost grid search (`tune_grid`) now passes the training objective inside `params`, as xgboost 3.x requires; xgboost had warned that the old form will become an error in a future version.
+
+- Added an `inst/CITATION` file and a reference to the FastRet paper (Fadil et al., 2026, <doi:10.1021/acs.jcim.6c01344>) in the package description and README.
+
+- Fixed the privacy-contact link in the GUI, which pointed to a page of the University of Regensburg that no longer exists.
+
+- Fixed a typo in the `biocViews` field of `DESCRIPTION`.
+
+- README: installation now leads with the CRAN release, mentions the hosted GUI at <https://fastret.spang-lab.de> and lists Selective Measuring as a feature.
+
+- Vignettes: corrected installation instructions, broken anchors, outdated function names and typos; documented the hyperparameter-tuning checkbox (Train) and the compound-matching option (Adjust) of the GUI; extended the contribution guidelines.
+
+- CI: updated GitHub Actions to their current major versions.
+
+
+# FastRet 1.5.1
+
+- The descriptor-cache builder (`updateCachedCDs()`) and the example-data
+  generator (`misc/scripts/make-example-data.R`) now download
+  `Measurements_v10P.xlsx` from the version-independent `example-data` release tag
+  instead of the `v1.3.0` package release, so all example/source artifacts live in
+  one place and the build no longer pins an old package-version tag.
+
+# FastRet 1.5.0
+
+Example datasets & models refresh:
+
+1. The bundled `RP` dataset (and `inst/extdata/RP.xlsx`) was regenerated from the
+   published `Measurements_v10P.xlsx` and now contains **458** metabolites (was
+   442), with an added `INCHIKEY` column.
+
+2. `inst/extdata/RP_adj.xlsx` (returned by `read_rpadj_xlsx()`) is now **real**
+   data: 25 `RP` metabolites re-measured under a steeper gradient (dataset
+   `RP_Steep` in the FastRet paper), replacing the previous synthetic file. It
+   also gains an `INCHIKEY` column.
+
+3. `inst/extdata/RP_lasso_model.rds` was retrained on the new 458-metabolite `RP`.
+
+4. The shipped chemical-descriptor cache (`inst/cachedata/CDs.sqlite`) was rebuilt
+   from `Measurements_v10P.xlsx`; the outdated `inst/extdata/Measurements_v8.xlsx`
+   is no longer shipped.
+
+5. Documentation and the Shiny GUI now offer direct download links to the example
+   files (hosted as GitHub release assets), so web-app users can follow the
+   tutorials without installing the package.
+
+# FastRet 1.4.5
+
+Model adjustment (compound matching):
+
+1. The default compound matching used by `adjust_frm()` now matches on
+   `"INCHIKEY"` alone (when complete InChIKeys are available in both `new_data`
+   and `frm$df`), instead of the previous `c("SMILES", "INCHIKEY")`. The InChIKey
+   is a structure-invariant identifier and alone uniquely identifies a molecule,
+   whereas SMILES is matched as an exact raw string and often differs in spelling
+   between datasets — so including it only made matching more fragile without
+   adding identifying power. This also aligns the package default with the
+   InChIKey-based matching used throughout the FastRet paper's adjustment
+   benchmarks. When InChIKeys are unavailable the fallback is unchanged
+   (`c("SMILES", "NAME")`), and an explicit `match_keys` argument still overrides
+   the default.
+
+2. The GUI's *Adjust* tab gained a "Compound matching" dropdown that exposes this
+   choice: *Automatic* (recommended; InChIKey when available, else Name+SMILES),
+   *InChIKey*, *Name*, or *Name + SMILES*. The selection is passed to
+   `adjust_frm()` as `match_keys`.
+
+# FastRet 1.4.4
+
+Hyperparameter tuning:
+
+1. `train_frm()`'s `tune_grid` argument now also accepts the grid-size keywords
+   `"tiny"`, `"small"` and `"large"` (in addition to an explicit `data.frame`),
+   e.g. `train_frm(method = "brt", tune_grid = "small")`.
+
+2. The built-in `"small"` grid was changed to a fast, effective 8-combination
+   Retip-style grid (`max_depth` 2-5, `eta` 0.01/0.02, with `gamma = 1`,
+   `colsample_bytree`/`subsample` 0.5, `min_child_weight` 10; the number of
+   boosting rounds is chosen by early stopping). In the FastRet paper's benchmark
+   this internal grid search matches the accuracy of Retip's own grid search.
+   (The predefined grids were not previously exposed, so this is not a breaking
+   change.)
+
+3. The GUI's *Train* tab gained a "Tune hyperparameters (grid search)" checkbox.
+   When enabled for XGBoost it runs the small grid search (a few extra seconds);
+   it has no effect for Lasso.
+
+# FastRet 1.4.3
+
+Bug fixes (GUI):
+
+1. Training from an uploaded workbook that contained an `INCHIKEY` column
+   crashed the whole GUI session (the UI greyed out and had to be restarted).
+   `train_frm()` keeps `INCHIKEY` in `frm$df` as metadata, but the *Train* tab's
+   result handler excluded only `NAME`/`RT`/`SMILES` before calling
+   `round(cds, 2)`, so the character `INCHIKEY` column made `round()` error. As
+   this ran inside a reactive status observer without a `tryCatch`, the error
+   tore down the session. The handler now excludes `INCHIKEY` too, and the
+   extended-task status observers are wrapped so any future handler error shows a
+   notification instead of killing the session. (This was not fixed by the 1.4.1
+   robust-upload change, which deliberately *keeps* `INCHIKEY`.)
+
+2. Dropped upload columns are no longer silent. When an uploaded workbook
+   contains columns FastRet does not use (anything other than
+   `NAME`/`RT`/`SMILES`/`INCHIKEY`/`RT_ADJ` and chemical descriptors), the GUI now
+   shows a notification naming the ignored columns, so it is clear they are not
+   carried into the results/download.
+
+# FastRet 1.4.2
+
+1. `train_frm()` gains a `tune_grid` argument: supplying a `data.frame` of
+   xgboost hyperparameters runs a cross-validated grid search over those rows for
+   `gbtree`/BRT models (instead of the fixed default parameters), making FastRet's
+   existing grid-search machinery user-accessible. `NULL` (default) is unchanged.
+
+# FastRet 1.4.1 <!-- Commit Date: 2026-06-26 -->
+
+GUI upload fixes:
+
+1. Large uploads are now accepted. Shiny's default request-size limit of 5 MB
+   rejected normal inputs such as an 8 MB adjusted model. The GUI now raises the
+   limit to 500 MB, so any model or data file a user is likely to upload is
+   accepted (`shiny.maxRequestSize`, set in `fastret_app()`).
+
+2. Excel uploads are read robustly. Instead of always reading the first
+   worksheet, FastRet now searches every worksheet for the first one that
+   contains the required columns (`RT`/`SMILES`/`NAME` for training, selective
+   measuring and adjustment; `NAME`/`SMILES` for prediction) and silently drops
+   any extra columns. Previously, uploading a workbook with additional columns
+   besides the required ones - or with the data on a sheet other than the first -
+   could cause model training to stall. New internal helpers `read_input_xlsx()`
+   and `drop_unsupported_columns()` implement this and are covered by tests.
+
+# FastRet 1.4.0 <!-- Commit Date: 2026-06-21 -->
+
+Chemical-descriptor cache:
+
+1. The chemical-descriptor cache is now a pure on-disk SQLite database
+   (`CDs.sqlite`) instead of an in-memory R option backed by `CDs.rds`. On first
+   use the shipped database is copied into the per-user cache directory
+   (`tools::R_user_dir("FastRet", "cache")`) and all reads and writes go there.
+   Because the cache lives on disk, descriptors computed in one process are
+   immediately visible to every other process and worker, so parallel training
+   and the GUI's background workers now share a single cache. Concurrent access
+   is made safe via SQLite WAL mode and `INSERT OR IGNORE`.
+
+2. `getCDs()`, `preprocess_data()`, `train_frm()`, `predict.frm()` and
+   `adjust_frm()` gained a `cache` argument. With `cache = TRUE` (default)
+   descriptors are read from and written to the on-disk cache; with
+   `cache = FALSE` the cache is bypassed and every descriptor is recomputed via
+   rCDK (useful for benchmarking the uncached runtime).
+
+3. Removed the internal `FastRet.cachedCDs` option and the `N_SMI_CACHED`
+   constant. CDK / `rcdklibs` >= 2.9 is required (already enforced at GUI startup
+   by `check_cdk_version()`), as it provides all descriptors in `CDFeatures`.
+
+GUI:
+
+1. Reworked the model-adjustment controls in the *Adjust* tab. The old
+   "Components of linear model" checkbox group (which let users toggle the
+   `RT`, `RT^2`, `RT^3`, `log(RT)`, `exp(RT)`, and `sqrt(RT)` predictors of a
+   linear adjustment model) has been replaced by an "Adjustment method" radio
+   button that lets users pick the model family used for the correction:
+   *Lasso* (recommended), *Linear model*, or *XGBoost*. Lasso and XGBoost adjust
+   using the base retention time together with the molecular descriptors and can
+   therefore capture compound-specific shifts, whereas the linear model fits a
+   simple straight-line correction from the base retention time only. The GUI now
+   passes `adj_type` to `adjust_frm()` accordingly; the deprecated RT-transformation
+   predictors are no longer exposed.
+
+2. Promoted the four workflows to dedicated navbar tabs (*Train*, *Select*,
+   *Adjust*, *Predict*) instead of selecting them from a single drop-down. Each
+   tab shows a short label with the full mode description on hover, and carries
+   only its own controls and results. The *Privacy Policy*, *Contact*, and
+   *About* pages remain as separate tabs.
+
+3. Simplified the *Train* sidebar to the essentials: data upload, method
+   (XGBoost/Lasso), seed, and the console log. The "Show advanced settings"
+   toggle and the "Preprocessing Options" checkbox group were removed --
+   GUI training now always uses the package defaults of `train_frm()`.
+
+4. GUI-trained models are now reproducible by default. The training seed
+   previously defaulted to the current system time and was never actually passed
+   to `train_frm()`; it now defaults to a fixed value (42) and is applied, so
+   training the same data twice yields identical models. The seed remains
+   user-editable.
+
+5. The console log is now always visible in every mode (the per-mode "Show
+   console logs" checkboxes were removed), including a new console-log box for
+   *Selective Measuring*.
+
+6. The *Selective Measuring* tab now exposes the selection variant (named as in
+   the paper: SMmax, SM1, SM0, SMinf, with an info button explaining each) and
+   the random seed, so users can pick the variant and reproduce a selection from
+   the GUI.
+
+7. Reviewed the GUI help texts for clarity, tone and formatting, and reworded the
+   prediction console output so it no longer implies that descriptors are
+   recomputed when they are served from the cache.
+
+8. Each tab's sidebar now starts with a heading (the mode name) and a help button
+   that explains, in a few sentences, what the mode is for and when to use it.
+
+Testing:
+
+1. Added `shinytest2` end-to-end GUI tests (`tests/testthat/test-gui-e2e.R`)
+   that drive the real app via headless Chrome and exercise every mode and model
+   type (Train: Lasso + XGBoost; Selective Measuring; Predict; Adjust: Lasso +
+   Linear model + XGBoost). They are skipped on CRAN and when Chrome/Java are
+   unavailable.
+
+Documentation:
+
+1. Rewrote the *GUI Usage* vignette to match the new navbar-tab layout and the
+   simplified sidebars, with up-to-date field/button names and a fresh
+   screenshot of every mode (Train/Select/Adjust/Predict). The screenshots are
+   regenerated reproducibly via `misc/scripts/make-gui-screenshots.R`.
+
+# FastRet 1.3.7 <!-- Commit Date: 2026-06-12 -->
+
+Bugfix:
+
+1. Removed a leftover `toscutil::stub()` development call from the cross-validation
+   path of `train_frm()`. The call had no effect on results (it only assigned
+   `predict.frm` argument defaults into a function environment that was never read
+   again), but it made `toscutil` — a `Suggests` package — a hard runtime dependency.
+   As a result, model training failed with "there is no package called 'toscutil'"
+   whenever `Suggests` packages were not installed (e.g. a plain CRAN install).
+
+Dependencies:
+
+1. Now requires `future (>= 1.40.0)`. `start_gui()` uses
+   `with(future::plan(...), local = TRUE)`, which relies on the
+   `with.FutureStrategyList` method introduced in future 1.40.0.
+
+# FastRet 1.3.6 <!-- Commit Date: 2026-06-11 -->
+
+Documentation:
+
+1. Improved the GUI documentation: corrected the description of the *Selective
+   Measuring* algorithm (PAM / k-medoids clustering, not k-means), added
+   step-by-step instructions and a Java/CDK troubleshooting note to the
+   `GUI-Usage` vignette, and fixed minor wording in the GUI help texts.
+
+# FastRet 1.3.5 <!-- Commit Date: 2026-01-13 -->
+
+Bugfix:
+
+1. `predict.frm()` now imputes missing/non-finite values not only for base model
+   predictors, but also for adjustment model predictors. This prevents `NA`
+   predictions if the adjustment model depends on predictors that are
+   missing/non-finite in the new data.
+
+Internal Improvements:
+
+1. Consolidated the imputation logic in `predict.frm()` into a shared internal
+   helper.
+
+# FastRet 1.3.4 <!-- Commit Date: 2026-01-12 -->
+
+Internal Improvements:
+
+1. `start_gui()` and `start_gui_in_devmode()` now rely on
+  `with(future::plan(...), local = TRUE)` so that temporary future plans are
+  restored automatically without manual bookkeeping.
+
+# FastRet 1.3.3 <!-- Commit Date: 2026-01-11 -->
+
+API Improvements:
+
+1. `selective_measuring()` accepts `"max"` and `"inf"` as additional values
+   for its `rt_coef` parameter:
+   - `"max"` is an alias for the existing `"max_ridge_coef"`
+   - `"inf"` sets all chemical descriptor features to zero before clustering so that
+     RT alone drives the distance metric (i.e., it is "infinitely" more important
+     than the chemical descriptors).
+
+# FastRet 1.3.2 <!-- Commit Date: 2026-01-11 -->
+
+Bugfix:
+
+1. `adjust_frm()` automatically switched to "lm" adjustment if `predictors`
+   contained only one predictor, regardless of whether `add_cds` was TRUE or
+   FALSE. This has now been fixed, so that "lasso", "ridge" and "gbtree"
+   adjustment is now possible if either `add_cds` is TRUE, `add_cds` is
+   `NULL` or `predictors` contains more than one predictor.
+
+# FastRet 1.3.1 <!-- Commit Date: 2026-01-11 -->
+
+API Improvements:
+
+1. Added arguments `match_rts` and `match_keys` to `adjust_frm()`:
+   - If `match_rts=TRUE` (default), RTs are obtained by matching rows in
+     `new_data` to rows in `frm$df` based on `match_keys`.
+   - If `match_rts=FALSE`, RTs are obtained by applying the base model to
+     `new_data`.
+   - `match_keys` can be any combination of "INCHIKEY", "SMILES" and "NAME". If
+     left at default NULL, SMILES+INCHIKEY is used if both columns are present
+     in the adjusted and the original training data. Otherwise, SMILES+NAME is
+     used.
 
 # FastRet 1.3.0 <!-- Commit Date: 2025-11-12 -->
 
@@ -26,7 +335,7 @@ API Improvements:
    - Added argument `rm_ucs` to control whether unsupported columns (i.e.
      columns that are neither mandatory nor optional) should be removed from the
      input data.
-  - Added argument `rt_terms` to control whether transformations of the RT column
+   - Added argument `rt_terms` to control whether transformations of the RT column
      (square, cube, log, exp, sqrt) should be added to the input data.
    - In case of missing mandatory columns (SMILES, RT, NAME) an error is now raised.
    - INCHIKEY and Chemical Descriptors listed in `CDFeatures` are allowed as
@@ -80,7 +389,7 @@ API Improvements:
 6. `selective_measuring()`:
    - Added argument `rt_coef`, allowing user to control the influence of RT on
      the clustering. A value of 0 means that RT is ignored, a value of
-    "max_ridge_coefficient" means that RT has the same weight as the most
+     "max_ridge_coefficient" means that RT has the same weight as the most
      important chemical descriptor and a value of 1 means no scaling at all
      (except standardization to z-scores, which is applied before to the whole
      dataset before the ridge regression is trained).
@@ -88,10 +397,10 @@ API Improvements:
    - Added argument `seed` to allow reproducible results.
    - Added argument `do_cv` to control whether cross-validation should be
      performed for performance estimation. Default is TRUE.
-    - Added argument `adj_type` to control which model should be trained for
-      adjustment: supported options are "lm", "lasso", "ridge", or "gbtree".
-      Previously, only "lm" was supported. To stay backwards compatible, the default
-      is "lm".
+   - Added argument `adj_type` to control which model should be trained for
+     adjustment: supported options are "lm", "lasso", "ridge", or "gbtree".
+     Previously, only "lm" was supported. To stay backwards compatible, the default
+     is "lm".
    - Added argument `add_cds` to control whether chemical descriptors should be
      added to the input data using `getCDs()`. Only recommended for adj_type other
      than "lm".
@@ -105,9 +414,9 @@ API Improvements:
      reproducibility.
    - Mapping is now performed by matching each new entry to the average RT of
      all original training entries with the same key (SMILES+INCHIKEY or
-    SMILES+NAME). Example: if the new dataset contains a key twice, and the
-    original training data contains the key three times, both new entries are
-    mapped to the average RT of the three original entries.
+     SMILES+NAME). Example: if the new dataset contains a key twice, and the
+     original training data contains the key three times, both new entries are
+     mapped to the average RT of the three original entries.
    - Performance estimation via cross-validation now uses the new clipping
      mechanism provided by `clip_predictions()`. Of course, the clipping is
      always based on the RT range of training folds, not the whole original
@@ -166,7 +475,7 @@ Internal Improvements:
 4. Replaced `fit_glmnet()`, `fit_lasso()` and `fit_ridge()` with a single
    function `fit_glmnet()`, that takes the method ("lasso" or "ridge") as
    parameter. Instead of a dataframe `df` that has to contain only predictors
-   plus the RT column (as reponse), the function now takes a matrix of
+   plus the RT column (as response), the function now takes a matrix of
    predictors `X` and a vector of responses `y`. This makes the function more
    flexible and easier to test.
 5. Replaced `fit_gbtree_grid()` with a much simpler function
@@ -353,7 +662,7 @@ Completely refactored source code, e.g.:
 # FastRet 0.99.7 <!-- Commit Date: 2023-11-30 -->
 
 - Fixed R CMD check findings
-- Fixed Github Actions
+- Fixed GitHub Actions
 - Fixed Dockerfile
 
 # FastRet 0.99.6 <!-- Commit Date: 2023-11-30 -->
@@ -363,7 +672,7 @@ Completely refactored source code, e.g.:
 
 # FastRet 0.99.4 <!-- Commit Date: 2023-11-29 -->
 
-- Improved Github Actions and Formatting of source code
+- Improved GitHub Actions and Formatting of source code
 
 # FastRet 0.99.3 <!-- Commit Date: 2023-11-29 -->
 

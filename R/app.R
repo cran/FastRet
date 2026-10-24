@@ -49,8 +49,10 @@ start_gui <- function(port = 8080,
     # Use [start_gui_in_devmode()] for development
     catf("Checking CDK version")
     check_cdk_version()
-    oldplan <- future::plan("multisession", workers = nw)
-    on.exit(future::plan(oldplan), add = TRUE)
+    catf("Initializing chemical-descriptor cache")
+    init_cache() # copy shipped cache into the user dir up front so the workers
+    # spawned below never race to create it and the first user action is fast
+    with(future::plan("multisession", workers = nw), local = TRUE)
     catf("Starting FastRet GUI")
     app <- fastret_app(port, host, reload, nsw)
     shiny::runApp(app)
@@ -86,6 +88,11 @@ fastret_app <- function(port = 8080,
                         host = "0.0.0.0",
                         reload = FALSE,
                         nsw = 1) {
+    # Allow large uploads. Shiny's default request-size cap is only 5 MB, which
+    # rejects perfectly normal inputs such as an 8 MB adjusted model. Raise the
+    # limit to 500 MB (unless a larger one is already configured) so any model
+    # or data file a user is likely to upload is accepted.
+    options(shiny.maxRequestSize = max(getOption("shiny.maxRequestSize", 0), 500 * 1024^2))
     shiny::shinyApp(
         ui = function(req) fastret_ui(req),
         server = function(input, output, session) fastret_server(input, output, session, nsw),
@@ -140,8 +147,7 @@ start_gui_in_devmode <- function(strategy = "sequential",
     ))
 
     catf("Initializing cluster")
-    oldplan <- future::plan(strategy)
-    on.exit(future::plan(oldplan), add = TRUE, after = FALSE)
+    with(future::plan(strategy), local = TRUE)
 
     catf("Starting FastRet GUI in development mode")
     pkg_root <- dirname(system.file("DESCRIPTION", package = "FastRet"))
